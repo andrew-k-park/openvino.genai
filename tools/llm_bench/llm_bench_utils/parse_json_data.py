@@ -4,13 +4,11 @@
 
 def create_base_prompt(json_data, key='prompt'):
     prompt_data = {}
-    if key in json_data:
-        if json_data[key] != "":
-            prompt_data[key] = json_data[key]
-        else:
-            raise RuntimeError(f"== {key} should not be empty string ==")
-    else:
+    if key not in json_data:
         raise RuntimeError(f"== key word '{key}' does not exist ==")
+    if json_data[key] == "":
+        raise RuntimeError(f"== {key} should not be empty string ==")
+    prompt_data[key] = json_data[key]
     return prompt_data
 
 
