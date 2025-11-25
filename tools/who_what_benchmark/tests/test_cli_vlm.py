@@ -9,16 +9,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def run_test(model_id, model_type, optimum_threshold, genai_threshold, tmp_path):
+def run_test(model_id, model_type, optimum_threshold, genai_threshold, convertion_task, tmp_path):
     if sys.platform == 'darwin':
         pytest.xfail("Ticket 173169")
     GT_FILE = tmp_path / "gt.csv"
     MODEL_PATH = tmp_path / model_id.replace("/", "_")
 
+    task = f"--task {convertion_task}" if convertion_task else ''
     result = subprocess.run(["optimum-cli", "export",
                              "openvino", "-m", model_id,
-                             MODEL_PATH, "--task",
-                             "image-text-to-text",
+                             MODEL_PATH, task,
                              "--trust-remote-code"],
                             capture_output=True,
                             text=True,
@@ -100,7 +100,7 @@ def run_test(model_id, model_type, optimum_threshold, genai_threshold, tmp_path)
     ],
 )
 def test_vlm_basic(model_id, model_type, tmp_path):
-    run_test(model_id, model_type, None, None, tmp_path)
+    run_test(model_id, model_type, None, None, "image-text-to-text", tmp_path)
 
 
 @pytest.mark.nanollava
@@ -111,4 +111,15 @@ def test_vlm_basic(model_id, model_type, tmp_path):
     ],
 )
 def test_vlm_nanollava(model_id, model_type, optimum_threshold, genai_threshold, tmp_path):
-    run_test(model_id, model_type, optimum_threshold, genai_threshold, tmp_path)
+    run_test(model_id, model_type, optimum_threshold, genai_threshold, "image-text-to-text", tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("model_id", "model_type", "optimum_threshold", "genai_threshold"),
+    [
+        ("katuni4ka/tiny-random-qwen2vl", "visual-text", 0.8),
+        ("katuni4ka/tiny-random-llava-next-video", "visual-text", 0.8),
+    ],
+)
+def test_vlm_nanollava(model_id, model_type, threshold, tmp_path):
+    run_test(model_id, model_type, threshold, threshold, None, tmp_path)
