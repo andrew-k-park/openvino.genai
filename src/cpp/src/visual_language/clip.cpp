@@ -65,6 +65,93 @@ void bilinear_resize(const clip_image_u8& src, clip_image_u8& dst, int target_wi
     }
 }
 
+void bicubic_resize_opt(const clip_image_u8& img, clip_image_u8& dst, int target_width, int target_height) {
+    const int nx = img.nx;
+    const int ny = img.ny;
+
+    dst.nx = target_width;
+    dst.ny = target_height;
+    dst.buf.resize(3 * target_width * target_height);
+
+    const float tx = static_cast<float>(nx) / static_cast<float>(target_width);
+    const float ty = static_cast<float>(ny) / static_cast<float>(target_height);
+
+    constexpr float _1_3 = 1.0f / 3.0f;
+    constexpr float _1_6 = 1.0f / 6.0f;
+
+    float pixels[4];
+
+    auto clip_coord = [](int x, int lower, int upper) -> int {
+        return std::max(lower, std::min(x, upper));
+    };
+
+    for (int i = 0; i < target_height; i++) {
+        const float fy = ty * i;
+        const int y = static_cast<int>(fy);
+        const float dy = fy - y;
+
+        const int y_coords[4] = {
+            clip_coord(y - 1, 0, ny - 1),
+            clip_coord(y, 0, ny - 1),
+            clip_coord(y + 1, 0, ny - 1),
+            clip_coord(y + 2, 0, ny - 1)
+        };
+
+        for (int j = 0; j < target_width; j++) {
+            const float fx = tx * j;
+            const int x = static_cast<int>(fx);
+            const float dx = fx - x;
+
+            const int x_coords[4] = {
+                clip_coord(x - 1, 0, nx - 1),
+                clip_coord(x, 0, nx - 1),
+                clip_coord(x + 1, 0, nx - 1),
+                clip_coord(x + 2, 0, nx - 1)
+            };
+
+            const int dst_base_idx = (i * target_width + j) * 3;
+
+            for (int k = 0; k < 3; k++) {
+                for (int jj = 0; jj < 4; jj++) {
+                    const int row_base = y_coords[jj] * nx;
+                    const uint8_t* row_ptr = &img.buf[row_base * 3 + k];
+
+                    const float p[4] = {
+                        static_cast<float>(row_ptr[x_coords[0] * 3]),
+                        static_cast<float>(row_ptr[x_coords[1] * 3]),
+                        static_cast<float>(row_ptr[x_coords[2] * 3]),
+                        static_cast<float>(row_ptr[x_coords[3] * 3])
+                    };
+
+                    const float a0 = p[1];
+                    const float d0 = p[0] - a0;
+                    const float d2 = p[2] - a0;
+                    const float d3 = p[3] - a0;
+                    const float a1 = -_1_3 * d0 + d2 - _1_6 * d3;
+                    const float a2 = 0.5f * (d0 + d2);
+                    const float a3 = -_1_6 * d0 - 0.5f * d2 + _1_6 * d3;
+
+                    pixels[jj] = a0 + dx * (a1 + dx * (a2 + dx * a3));
+                }
+
+                const float a0 = pixels[1];
+                const float d0 = pixels[0] - a0;
+                const float d2 = pixels[2] - a0;
+                const float d3 = pixels[3] - a0;
+                const float a1 = -_1_3 * d0 + d2 - _1_6 * d3;
+                const float a2 = 0.5f * (d0 + d2);
+                const float a3 = -_1_6 * d0 - 0.5f * d2 + _1_6 * d3;
+
+                const float result = a0 + dy * (a1 + dy * (a2 + dy * a3));
+
+                dst.buf[dst_base_idx + k] = static_cast<uint8_t>(
+                    std::min(std::max(std::round(result), 0.0f), 255.0f)
+                );
+            }
+        }
+    }
+}
+
 template<typename NUM>
 NUM clip(NUM x, NUM lower, NUM upper) {
     return std::max(lower, std::min(x, upper));
