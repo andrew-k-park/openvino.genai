@@ -1,12 +1,177 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
+#include <iostream>
+#include <openvino/openvino.hpp>
+#include <openvino/op/ops.hpp>
+
 #include "visual_language/llava_next_video/classes.hpp"
 #include "visual_language/clip.hpp"
 #include "visual_language/processor_config.hpp"
 
 
 namespace ov::genai {
+
+// Create preprocessing pipeline as OpenVINO model
+std::shared_ptr<ov::Model> create_preprocessing_model(const ProcessorConfig& config) {
+    using namespace ov;
+    using namespace ov::op;
+    
+    // Input: [1, H, W, 3] uint8 image
+    auto input = std::make_shared<v0::Parameter>(element::u8, PartialShape{1, -1, -1, 3});
+    input->set_friendly_name("input_image");
+    
+    // 1. Convert uint8 -> float32
+    auto convert = std::make_shared<v0::Convert>(input, element::f32);
+    
+    // 2. Resize with bicubic interpolation
+    std::vector<int32_t> target_sizes_data = {
+        static_cast<int32_t>(config.crop_size_height), 
+        static_cast<int32_t>(config.crop_size_width)
+    };
+    auto target_sizes = v0::Constant::create(element::i32, Shape{2}, target_sizes_data);
+
+    std::vector<int32_t> axes_data = {1, 2}; // Height, Width axes
+    auto axes = v0::Constant::create(element::i32, Shape{2}, axes_data);
+
+    v11::Interpolate::InterpolateAttrs attrs;
+    attrs.mode = v11::Interpolate::InterpolateMode::CUBIC;
+    attrs.shape_calculation_mode = v11::Interpolate::ShapeCalcMode::SIZES;
+    attrs.coordinate_transformation_mode = v11::Interpolate::CoordinateTransformMode::PYTORCH_HALF_PIXEL;
+    attrs.nearest_mode = v11::Interpolate::NearestMode::ROUND_PREFER_FLOOR;
+    attrs.antialias = false;
+    attrs.cube_coeff = -0.75; // Bicubic coefficient
+
+    // ✅ Correct constructor: (input, sizes, axes, attrs) - 4 parameters
+    auto resize = std::make_shared<v11::Interpolate>(convert, target_sizes, axes, attrs);
+    
+    // 3. Center crop to [crop_size_height, crop_size_width]
+    std::vector<int32_t> begin_data = {0, 0, 0, 0};
+    auto begin = v0::Constant::create(element::i32, Shape{4}, begin_data);
+
+    std::vector<int32_t> end_data = {
+        1, 
+        static_cast<int32_t>(config.crop_size_height), 
+        static_cast<int32_t>(config.crop_size_width), 
+        3
+    };
+    auto end = v0::Constant::create(element::i32, Shape{4}, end_data);
+
+    std::vector<int32_t> strides_data = {1, 1, 1, 1};
+    auto strides = v0::Constant::create(element::i32, Shape{4}, strides_data);
+
+    auto crop = std::make_shared<v1::StridedSlice>(
+        resize, begin, end, strides,
+        std::vector<int64_t>{0, 0, 0, 0}, // begin_mask
+        std::vector<int64_t>{0, 0, 0, 0}  // end_mask
+    );
+    
+    // 4. Normalize: (pixel / 255.0 - mean) / std
+    std::vector<float> mean_data = {
+        config.image_mean[0] * 255.0f, 
+        config.image_mean[1] * 255.0f, 
+        config.image_mean[2] * 255.0f
+    };
+    auto mean_const = v0::Constant::create(element::f32, Shape{1, 1, 1, 3}, mean_data);
+
+    std::vector<float> std_data = {
+        config.image_std[0] * 255.0f, 
+        config.image_std[1] * 255.0f, 
+        config.image_std[2] * 255.0f
+    };
+    auto std_const = v0::Constant::create(element::f32, Shape{1, 1, 1, 3}, std_data);
+
+    auto sub_mean = std::make_shared<v1::Subtract>(crop, mean_const);
+    auto div_std = std::make_shared<v1::Divide>(sub_mean, std_const);
+    
+    // 5. Convert NHWC -> NCHW
+    std::vector<int32_t> transpose_order_data = {0, 3, 1, 2}; // NHWC -> NCHW
+    auto transpose_order = v0::Constant::create(element::i32, Shape{4}, transpose_order_data);
+    auto transpose = std::make_shared<v1::Transpose>(div_std, transpose_order);
+    
+    transpose->set_friendly_name("preprocessed_output");
+    
+    // Create model
+    auto model = std::make_shared<ov::Model>(
+        OutputVector{transpose},
+        ParameterVector{input},
+        "preprocessing_pipeline"
+    );
+    
+    return model;
+}
+
+// Execute preprocessing using OpenVINO
+clip_image_f32 preprocess_with_ov_model(
+    const clip_image_u8& image, 
+    ProcessorConfig& config,
+    ov::Core& core,
+    const std::string& device = "CPU"
+) {
+    auto t_total_start = std::chrono::steady_clock::now();
+    
+    // Create preprocessing model (cached compilation recommended)
+    static std::shared_ptr<ov::Model> preproc_model = nullptr;
+    static ov::CompiledModel compiled_model;
+    
+    if (!preproc_model) {
+        auto t_create_start = std::chrono::steady_clock::now();
+        preproc_model = create_preprocessing_model(config);
+        
+        // Compile model
+        compiled_model = core.compile_model(preproc_model, device);
+        auto t_create_end = std::chrono::steady_clock::now();
+        auto create_us = std::chrono::duration_cast<std::chrono::microseconds>(t_create_end - t_create_start).count();
+        std::cout << "[ INFO ] [perf] **** OV preprocessing model compilation: " << create_us << " us" << std::endl;
+    }
+    
+    // Create inference request
+    auto infer_request = compiled_model.create_infer_request();
+    
+    // Prepare input tensor [1, H, W, 3]
+    ov::Tensor input_tensor(ov::element::u8, {1, static_cast<size_t>(image.ny), static_cast<size_t>(image.nx), 3});
+    uint8_t* input_data = input_tensor.data<uint8_t>();
+    
+    // Copy image data (RGB -> RGB)
+    for (int y = 0; y < image.ny; y++) {
+        for (int x = 0; x < image.nx; x++) {
+            for (int c = 0; c < 3; c++) {
+                input_data[(y * image.nx + x) * 3 + c] = image.buf[(y * image.nx + x) * 3 + c];
+            }
+        }
+    }
+    
+    // Set input tensor
+    infer_request.set_input_tensor(input_tensor);
+    
+    // Run inference
+    auto t_infer_start = std::chrono::steady_clock::now();
+    infer_request.infer();
+    auto t_infer_end = std::chrono::steady_clock::now();
+    auto infer_us = std::chrono::duration_cast<std::chrono::microseconds>(t_infer_end - t_infer_start).count();
+    std::cout << "[ INFO ] [perf] **** OV preprocessing inference: " << infer_us << " us" << std::endl;
+    
+    // Get output tensor [1, 3, H, W]
+    auto output_tensor = infer_request.get_output_tensor();
+    auto output_shape = output_tensor.get_shape();
+    
+    // Convert to clip_image_f32
+    clip_image_f32 result;
+    result.nx = static_cast<int>(output_shape[3]);
+    result.ny = static_cast<int>(output_shape[2]);
+    result.buf.resize(3 * result.nx * result.ny);
+    
+    const float* output_data = output_tensor.data<float>();
+    std::memcpy(result.buf.data(), output_data, result.buf.size() * sizeof(float));
+    
+    auto t_total_end = std::chrono::steady_clock::now();
+    auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_total_end - t_total_start).count();
+    std::cout << "[ INFO ] [perf] **** Total OV preprocessing: " << total_us << " us" << std::endl;
+    
+    return result;
+}
+
 
 std::pair<size_t, size_t> get_unpadded_features(size_t height, size_t width, size_t patches_height, size_t patches_width, size_t scale_height, size_t scale_width) {
     size_t current_height = patches_height * scale_height;
@@ -53,6 +218,30 @@ clip_image_f32 preprocess_clip_image_llava_next_video(const clip_image_u8& image
     }
 
     return normalize_and_convert_to_chw(cropped_image, ctx);
+}
+
+// Wrapper function with automatic fallback
+clip_image_f32 preprocess_clip_image_llava_next_video_hybrid(
+    const clip_image_u8& image, 
+    ProcessorConfig& config
+) {
+    // Check environment variable for OV preprocessing
+    static bool use_ov_pipeline = []() {
+        const char* env_val = std::getenv("OV_GENAI_USE_OV_PREPROCESSING");
+        if (env_val) {
+            std::string val_str(env_val);
+            return (val_str == "1" || val_str == "true" || val_str == "TRUE");
+        }
+        return false; // Default: use CPU implementation
+    }();
+
+    if (use_ov_pipeline) {
+        static ov::Core core;
+        return preprocess_with_ov_model(image, config, core, "GPU");
+    } else {
+        // Original CPU implementation
+        return preprocess_clip_image_llava_next_video(image, config);
+    }
 }
 
 VisionEncoderLLaVANextVideo::VisionEncoderLLaVANextVideo(
@@ -263,7 +452,12 @@ std::pair<std::vector<ov::Tensor>, size_t> VisionEncoderLLaVANextVideo::preproce
     size_t num_frames = frames.size();
     for (size_t i=0; i < num_frames; i++) {
         clip_image_u8 clip_image = tensor_to_clip_image_u8(frames[i]);
-        auto preprocessed = preprocess_clip_image_llava_next_video(clip_image, config);
+        auto t_preproc_clip_img_start = std::chrono::steady_clock::now();
+        // auto preprocessed = preprocess_clip_image_llava_next_video(clip_image, config);
+        auto preprocessed = preprocess_clip_image_llava_next_video_hybrid(clip_image, config);
+        auto t_preproc_clip_img_end = std::chrono::steady_clock::now();
+        auto preproc_clip_img_us = std::chrono::duration_cast<std::chrono::microseconds>(t_preproc_clip_img_end - t_preproc_clip_img_start).count();
+        std::cout << "[ INFO ] [perf] *** preprocess_clip_image_llava_next_video: " << preproc_clip_img_us << " us" << std::endl;
         auto preprocessed_tensor = clip_image_f32_to_tensor(preprocessed);
         res.push_back(preprocessed_tensor);
 
@@ -284,7 +478,11 @@ std::vector<ov::genai::EncodedVideo> InputsEmbedderLLaVANextVideo::encode_videos
     for (const auto video: videos) {
         std::vector<ov::Tensor> frames = to_single_image_tensors({video});
         auto vision_encoder = std::static_pointer_cast<VisionEncoderLLaVANextVideo>(m_vision_encoder);
+        auto t_preproc_frames_start = std::chrono::steady_clock::now();
         auto [prepprocessed_frames, num_video_tokens] = vision_encoder->preprocess_frames(frames);
+        auto t_preproc_frames_end = std::chrono::steady_clock::now();
+        auto preproc_frames_us = std::chrono::duration_cast<std::chrono::microseconds>(t_preproc_frames_end - t_preproc_frames_start).count();
+        std::cout << "[ INFO ] [perf] ** preprocess_frames: " << preproc_frames_us << " us" << std::endl;
 
         // concat preprocessed frames to single tensor
         ov::Shape concat_shape = prepprocessed_frames[0].get_shape();
