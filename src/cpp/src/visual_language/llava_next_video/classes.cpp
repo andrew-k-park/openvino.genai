@@ -1,6 +1,8 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
+#include <iostream>
 #include "visual_language/llava_next_video/classes.hpp"
 #include "visual_language/clip.hpp"
 #include "visual_language/processor_config.hpp"
@@ -187,19 +189,28 @@ std::pair<size_t, size_t> get_unpadded_features(size_t height, size_t width, siz
     return {unpadded_features, newline_features};
 }
 
-clip_image_f32 preprocess_clip_image_llava_next_video(const clip_image_u8& image, ProcessorConfig& config) {
+std::tuple<clip_image_f32, long long, long long, long long> preprocess_clip_image_llava_next_video(const clip_image_u8& image, ProcessorConfig& config) {
     // Resize
+    auto t_bicubic_resize_start = std::chrono::steady_clock::now();
     clip_image_u8 resized_image;
     int target_size = config.size_shortest_edge;
     float scale = static_cast<float>(target_size) / std::min(image.nx, image.ny);
     int new_width = static_cast<int>(image.nx * scale);
     int new_height = static_cast<int>(image.ny * scale);
     bicubic_resize(image, resized_image, new_width, new_height);
+    auto t_bicubic_resize_end = std::chrono::steady_clock::now();
+    auto bicubic_resize_us = std::chrono::duration_cast<std::chrono::microseconds>(t_bicubic_resize_end - t_bicubic_resize_start).count();
+    std::cout << "[ INFO ] [perf] **** bicubic_resize_opt: " << bicubic_resize_us << " us" << std::endl;
 
     // Center crop
+    auto t_center_crop_start = std::chrono::steady_clock::now();
     clip_image_u8 cropped_image = center_crop(resized_image, config.crop_size_height, config.crop_size_width);
+    auto t_center_crop_end = std::chrono::steady_clock::now();
+    auto center_crop_us = std::chrono::duration_cast<std::chrono::microseconds>(t_center_crop_end - t_center_crop_start).count();
+    std::cout << "[ INFO ] [perf] **** center_crop: " << center_crop_us << " us" << std::endl;
 
     // Normalize
+    auto t_norm_start = std::chrono::steady_clock::now();
     clip_ctx_double ctx;
 
     // apply fused normalize and rescale to 1.0/255, by the formula: 
@@ -209,7 +220,11 @@ clip_image_f32 preprocess_clip_image_llava_next_video(const clip_image_u8& image
         ctx.image_std[c] = config.image_std[c] * 255;
     }
 
-    return normalize_and_convert_to_chw(cropped_image, ctx);
+    auto result = normalize_and_convert_to_chw(cropped_image, ctx);
+    auto t_norm_end = std::chrono::steady_clock::now();
+    auto norm_us = std::chrono::duration_cast<std::chrono::microseconds>(t_norm_end - t_norm_start).count();
+    std::cout << "[ INFO ] [perf] **** normalize_and_convert_to_chw: " << norm_us << " us" << std::endl;
+    return std::make_tuple(result, bicubic_resize_us, center_crop_us, norm_us);
 }
 
 VisionEncoderLLaVANextVideo::VisionEncoderLLaVANextVideo(
@@ -383,7 +398,7 @@ ov::Tensor InputsEmbedderLLaVANextVideo::get_inputs_embeds(
     const std::vector<size_t>& images_sequence,
     const std::vector<size_t>& videos_sequence,
     const std::vector<std::pair<std::size_t, std::size_t>>& history_vision_count) {
-
+    
     ov::Tensor image_newline;
     size_t searched_pos = 0;
     std::vector<ov::Tensor> image_embeds;
@@ -440,12 +455,26 @@ std::pair<std::vector<ov::Tensor>, size_t> VisionEncoderLLaVANextVideo::preproce
     // preprocess frames using CPU
     ProcessorConfig config = get_processor_config();
     size_t num_frames = frames.size();
+    
+    long long total_bicubic_us = 0;
+    long long total_crop_us = 0;
+    long long total_norm_us = 0;
+
     for (size_t i = 0; i < num_frames; i++) {
         clip_image_u8 clip_image = tensor_to_clip_image_u8(frames[i]);
-        auto preprocessed = preprocess_clip_image_llava_next_video(clip_image, config);
+        auto [preprocessed, bicubic_us, crop_us, norm_us] = preprocess_clip_image_llava_next_video(clip_image, config);
         auto preprocessed_tensor = clip_image_f32_to_tensor(preprocessed);
         res.push_back(preprocessed_tensor);
+        
+        total_bicubic_us += bicubic_us;
+        total_crop_us += crop_us;
+        total_norm_us += norm_us;
     }
+
+    std::cout << "[ INFO ] [perf] *** bicubic_resize total: " << total_bicubic_us << " us, avg: " << (total_bicubic_us / num_frames) << " us" << std::endl;
+    std::cout << "[ INFO ] [perf] *** center_crop total: " << total_crop_us << " us, avg: " << (total_crop_us / num_frames) << " us" << std::endl;
+    std::cout << "[ INFO ] [perf] *** normalize_and_convert_to_chw total: " << total_norm_us << " us, avg: " << (total_norm_us / num_frames) << " us" << std::endl;
+    std::cout << "[ INFO ] [perf] *** preprocess_clip_image_llava_next_video total: " << (total_bicubic_us + total_crop_us + total_norm_us) << " us, avg: " << ((total_bicubic_us + total_crop_us + total_norm_us) / num_frames) << " us" << std::endl;
 
     ov::Shape resized_shape = res[0].get_shape();
     size_t height = resized_shape[2];
@@ -466,7 +495,7 @@ std::pair<std::vector<ov::Tensor>, size_t> VisionEncoderLLaVANextVideo::preproce
 
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(m_ireq_queue_preprocess.get());
     ov::InferRequest& preprocess = infer_request_guard.get();
-
+    
     for (size_t i = 0; i < num_frames; i++) {
         // Calculate target size after resize (based on size_shortest_edge)
         auto frame_shape = frames[i].get_shape();
@@ -475,10 +504,10 @@ std::pair<std::vector<ov::Tensor>, size_t> VisionEncoderLLaVANextVideo::preproce
         float scale = static_cast<float>(config.size_shortest_edge) / std::min(orig_height, orig_width);
         int64_t new_height = static_cast<int64_t>(orig_height * scale);
         int64_t new_width = static_cast<int64_t>(orig_width * scale);
-
+    
         // Set frame image as input (index 0: frame_image)
         preprocess.set_input_tensor(0, frames[i]);
-
+        
         // Set resize target size parameter (index 1: resize_target_size)
         ov::Tensor resize_target_size(ov::element::i64, {2});
         resize_target_size.data<int64_t>()[0] = new_height;
@@ -522,9 +551,13 @@ std::vector<ov::genai::EncodedVideo> InputsEmbedderLLaVANextVideo::encode_videos
         auto vision_encoder = std::static_pointer_cast<VisionEncoderLLaVANextVideo>(m_vision_encoder);
 
         // Use OV or CPU preprocessing based on configuration
+        auto t_preproc_frames_start = std::chrono::steady_clock::now();
         auto [prepprocessed_frames, num_video_tokens] = vision_encoder->get_use_ov_preprocess() 
             ? vision_encoder->preprocess_frames_ov(frames)
             : vision_encoder->preprocess_frames_cpp(frames);
+        auto t_preproc_frames_end = std::chrono::steady_clock::now();
+        auto preproc_frames_us = std::chrono::duration_cast<std::chrono::microseconds>(t_preproc_frames_end - t_preproc_frames_start).count();
+        std::cout << "[ INFO ] [perf] ** preprocess_frames: " << preproc_frames_us << " us" << std::endl;
 
         // concat preprocessed frames to single tensor
         ov::Shape concat_shape = prepprocessed_frames[0].get_shape();
@@ -538,6 +571,7 @@ std::vector<ov::genai::EncodedVideo> InputsEmbedderLLaVANextVideo::encode_videos
         }
 
         // infer video feature extraction models
+        auto t_vfe_models_infer_start = std::chrono::steady_clock::now();
         CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(vision_encoder->get_vision_encoder());
         ov::InferRequest& encoder = infer_request_guard.get();
         CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard_mm_projector(vision_encoder->get_multi_modal_projector());
@@ -550,6 +584,9 @@ std::vector<ov::genai::EncodedVideo> InputsEmbedderLLaVANextVideo::encode_videos
         resampler.infer();
         mm_projector.set_tensor("image_features", resampler.get_output_tensor());
         mm_projector.infer();
+        auto t_vfe_models_infer_end = std::chrono::steady_clock::now();
+        auto vfe_models_infer_us = std::chrono::duration_cast<std::chrono::microseconds>(t_vfe_models_infer_end - t_vfe_models_infer_start).count();
+        std::cout << "[ INFO ] [perf] ** video feature extranction models infer: " << vfe_models_infer_us << " us" << std::endl;
 
         // copy infer output to ensure it is not overwritten during next inference
         const ov::Tensor& infer_output = mm_projector.get_output_tensor();
