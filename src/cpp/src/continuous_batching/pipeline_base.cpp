@@ -1,6 +1,8 @@
 // Copyright (C) 2023-2025 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <chrono>
+#include <iostream>
 #include "continuous_batching/pipeline_base.hpp"
 
 namespace ov::genai {
@@ -262,14 +264,23 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         const auto& prompt = prompts[0];
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
 
+        auto t_enc_img_start = std::chrono::steady_clock::now();
         encoded_images = m_inputs_embedder->encode_images(images_vector[0]);
+        auto t_enc_img_end = std::chrono::steady_clock::now();
+        auto enc_img_us = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_img_end - t_enc_img_start).count();
+        std::cout << "[ INFO ] [perf] encode_images: " << enc_img_us << " us" << std::endl;
         m_history_images.insert(m_history_images.end(), encoded_images.begin(), encoded_images.end());
-
+        auto t_enc_vid_start = std::chrono::steady_clock::now();
         encoded_videos = m_inputs_embedder->encode_videos(videos_vector[0]);
+        auto t_enc_vid_end = std::chrono::steady_clock::now();
+        auto enc_vid_us = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_vid_end - t_enc_vid_start).count();
+        std::cout << "[ INFO ] [perf] encode_videos: " << enc_vid_us << " us" << std::endl;
         m_history_videos.insert(m_history_videos.end(), encoded_videos.begin(), encoded_videos.end());
-
+        auto t_norm_start = std::chrono::steady_clock::now();
         auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
-
+        auto t_norm_end = std::chrono::steady_clock::now();
+        auto norm_us = std::chrono::duration_cast<std::chrono::microseconds>(t_norm_end - t_norm_start).count();
+        std::cout << "[ INFO ] [perf] normalize_prompt: " << norm_us << " us" << std::endl;
         m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
         m_history_image_ids.insert(m_history_image_ids.end(), image_sequence.begin(), image_sequence.end());
         m_history_video_ids.insert(m_history_video_ids.end(), video_sequence.begin(), video_sequence.end());
@@ -278,6 +289,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         std::string templated_history = m_tokenizer.apply_chat_template(m_history, true);
 
         m_inputs_embedder->set_apply_chat_template_status(false);
+        auto start_pure_get_inputs_embeds = std::chrono::steady_clock::now();
         if (m_inputs_embedder->has_token_type_ids()) {
             auto [embeds, tt_ids] = m_inputs_embedder->get_inputs_embeds_with_token_type_ids(templated_history,
                                                                                              m_history_images,
@@ -302,6 +314,9 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[0].get_shape()[1], 0));
 
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
+        auto end_pure_get_inputs_embeds = std::chrono::steady_clock::now();
+        auto get_in_emb_us = std::chrono::duration_cast<std::chrono::microseconds>(end_pure_get_inputs_embeds - start_pure_get_inputs_embeds).count();
+        std::cout << "[ INFO ] [perf] pure get_inputs_embeds: " << get_in_emb_us << " us" << std::endl;
         vlm_perf_metrics[0].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
 
     } else {
@@ -311,13 +326,27 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             
             auto images_to_encode = images_vector.size() > 0 ? images_vector[i] : std::vector<ov::Tensor>{};
             auto videos_to_encode = videos_vector.size() > 0 ? videos_vector[i] : std::vector<ov::Tensor>{};
+            auto t_enc_img_start = std::chrono::steady_clock::now();
             const auto encoded_images = m_inputs_embedder->encode_images(images_to_encode);
-            const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
+            auto t_enc_img_end = std::chrono::steady_clock::now();
+            auto enc_img_us = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_img_end - t_enc_img_start).count();
+            std::cout << "[ INFO ] [perf] encode_images: " << enc_img_us << " us" << std::endl;
 
+            auto t_enc_vid_start = std::chrono::steady_clock::now();
+            const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
+            auto t_enc_vid_end = std::chrono::steady_clock::now();
+            auto enc_vid_us = std::chrono::duration_cast<std::chrono::microseconds>(t_enc_vid_end - t_enc_vid_start).count();
+            std::cout << "[ INFO ] [perf] encode_videos: " << enc_vid_us << " us" << std::endl;
+
+            auto t_norm_start = std::chrono::steady_clock::now();
             auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+            auto t_norm_end = std::chrono::steady_clock::now();
+            auto norm_us = std::chrono::duration_cast<std::chrono::microseconds>(t_norm_end - t_norm_start).count();
+            std::cout << "[ INFO ] [perf] normalize_prompt: " << norm_us << " us" << std::endl;
 
             m_inputs_embedder->set_apply_chat_template_status(sampling_params[i].apply_chat_template);
 
+            auto start_pure_get_inputs_embeds = std::chrono::steady_clock::now();
             if (m_inputs_embedder->has_token_type_ids()) {
                 auto [embeds, tt_ids] = m_inputs_embedder->get_inputs_embeds_with_token_type_ids(unified_prompt,
                                                                                                  encoded_images,
@@ -334,6 +363,9 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[i].get_shape()[1], 0));
         
             auto end_get_inputs_embeds = std::chrono::steady_clock::now();
+            auto end_pure_get_inputs_embeds = std::chrono::steady_clock::now();
+            auto get_in_emb_us = std::chrono::duration_cast<std::chrono::microseconds>(end_pure_get_inputs_embeds - start_pure_get_inputs_embeds).count();
+            std::cout << "[ INFO ] [perf] pure get_inputs_embeds: " << get_in_emb_us << " us" << std::endl;
             vlm_perf_metrics[i].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
         }
     }
