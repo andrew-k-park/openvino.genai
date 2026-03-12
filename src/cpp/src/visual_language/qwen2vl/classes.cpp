@@ -23,6 +23,9 @@
 
 #include "visual_language/vl_sdpa_transformations.hpp"
 
+#include <chrono>
+#include <iostream>
+
 namespace ov::genai {
 
 namespace {
@@ -582,39 +585,58 @@ ov::Tensor merge_text_and_video_image_embeddings(
     const int64_t image_pad_token_id,
     const int64_t video_pad_token_id
 ) {
-    ov::Tensor merged_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
-    std::memcpy(merged_embeds.data(), text_embeds.data(), text_embeds.get_byte_size());
-
+    auto mt0 = std::chrono::steady_clock::now();
     auto text_embeds_shape = text_embeds.get_shape();
     size_t batch_size = text_embeds_shape.at(0);
     size_t seq_length = text_embeds_shape.at(1);
     size_t hidden_size = text_embeds_shape.at(2);
+    size_t hidden_bytes = hidden_size * sizeof(float);
+
+    ov::Tensor merged_embeds(text_embeds.get_element_type(), text_embeds_shape);
 
     const int64_t* input_ids_data = input_ids.data<const int64_t>();
-    float* merged_embeds_data = merged_embeds.data<float>();
-    const float* image_embeds_data = processed_image_embeds.data<const float>();
-    const float* video_embeds_data = processed_video_embeds.data<const float>();
+    float* merged_data = merged_embeds.data<float>();
+    const float* text_data = text_embeds.data<const float>();
+    const float* image_data = processed_image_embeds.data<const float>();
+    const float* video_data = processed_video_embeds.data<const float>();
 
-    size_t image_embed_idx = 0;
-    size_t video_embed_idx = 0;
+    size_t img_idx = 0, vid_idx = 0;
     const int64_t img_token = image_pad_token_id;
     const int64_t vid_token = video_pad_token_id;
+
+    // Single-pass block-copy: detect contiguous runs of text/image/video tokens
+    // and copy each block with one memcpy, avoiding a separate bulk copy of text_embeds.
     for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        for (size_t seq_idx = 0; seq_idx < seq_length; ++seq_idx) {
-            size_t flat_idx = batch_idx * seq_length + seq_idx;
-            if (input_ids_data[flat_idx] == vid_token) {
-                std::copy_n(video_embeds_data + video_embed_idx * hidden_size,
-                            hidden_size,
-                            merged_embeds_data + flat_idx * hidden_size);
-                ++video_embed_idx;
-            } else if (input_ids_data[flat_idx] == img_token) {
-                std::copy_n(image_embeds_data + image_embed_idx * hidden_size,
-                            hidden_size,
-                            merged_embeds_data + flat_idx * hidden_size);
-                ++image_embed_idx;
+        const int64_t* batch_ids = input_ids_data + batch_idx * seq_length;
+        float* batch_dst = merged_data + batch_idx * seq_length * hidden_size;
+        const float* batch_text = text_data + batch_idx * seq_length * hidden_size;
+
+        size_t i = 0;
+        while (i < seq_length) {
+            if (batch_ids[i] == img_token) {
+                size_t start = i;
+                while (i < seq_length && batch_ids[i] == img_token) ++i;
+                size_t count = i - start;
+                std::memcpy(batch_dst + start * hidden_size, image_data + img_idx * hidden_size, count * hidden_bytes);
+                img_idx += count;
+            } else if (batch_ids[i] == vid_token) {
+                size_t start = i;
+                while (i < seq_length && batch_ids[i] == vid_token) ++i;
+                size_t count = i - start;
+                std::memcpy(batch_dst + start * hidden_size, video_data + vid_idx * hidden_size, count * hidden_bytes);
+                vid_idx += count;
+            } else {
+                size_t start = i;
+                while (i < seq_length && batch_ids[i] != img_token && batch_ids[i] != vid_token) ++i;
+                size_t count = i - start;
+                std::memcpy(batch_dst + start * hidden_size, batch_text + start * hidden_size, count * hidden_bytes);
             }
         }
     }
+    auto mt1 = std::chrono::steady_clock::now();
+    std::cout << "[TIMING] merge_text_and_video_image_embeddings (seq=" << seq_length
+              << ", hidden=" << hidden_size << ", bytes=" << text_embeds.get_byte_size()
+              << "): " << std::chrono::duration_cast<std::chrono::microseconds>(mt1 - mt0).count() << " us" << std::endl;
     return merged_embeds;
 }
     
@@ -1358,6 +1380,7 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen2VL::run_video_image_embeddi
 }
 
 ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::array<size_t, 3>>& grids_thw) const {
+    auto rp0 = std::chrono::steady_clock::now();
     const size_t spatial_merge_size = m_vision_encoder->get_processor_config().merge_size;
 
     std::vector<std::vector<size_t>> all_pos_ids;
@@ -1396,6 +1419,7 @@ ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::arra
             }
         }
     }
+    auto rp1 = std::chrono::steady_clock::now();
 
     // Calculate rotary embeddings for max_grid_size
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
@@ -1415,6 +1439,7 @@ ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::arra
             freqs[i][j] = static_cast<float>(i) * inv_freq[j];
         }
     }
+    auto rp2 = std::chrono::steady_clock::now();
 
     ov::Tensor rotary_pos_emb(ov::element::f32, {all_pos_ids.size(), dim});
     float* output_data = rotary_pos_emb.data<float>();
@@ -1426,6 +1451,13 @@ ov::Tensor InputsEmbedderQwen2VL::get_rotary_pos_emb(const std::vector<std::arra
         std::copy_n(freqs[h_idx].begin(), dim / 2, output_data + i * dim);
         std::copy_n(freqs[w_idx].begin(), dim / 2, output_data + i * dim + dim / 2);
     }
+    auto rp3 = std::chrono::steady_clock::now();
+
+    std::cout << "[TIMING] get_rotary_pos_emb (positions=" << all_pos_ids.size() << ", dim=" << dim << "):\n"
+              << "  build_pos_ids:          " << std::chrono::duration_cast<std::chrono::microseconds>(rp1 - rp0).count() << " us\n"
+              << "  compute_freqs:          " << std::chrono::duration_cast<std::chrono::microseconds>(rp2 - rp1).count() << " us\n"
+              << "  assemble_tensor:        " << std::chrono::duration_cast<std::chrono::microseconds>(rp3 - rp2).count() << " us\n"
+              << "  TOTAL:                  " << std::chrono::duration_cast<std::chrono::microseconds>(rp3 - rp0).count() << " us" << std::endl;
 
     return rotary_pos_emb;
 }
@@ -1477,6 +1509,7 @@ ov::Tensor InputsEmbedderQwen2VL::create_position_ids(
     const int64_t vision_start_token_id,
     const std::vector<std::pair<std::size_t, std::size_t>>& history_vision_count
 ) {
+    auto cp0 = std::chrono::steady_clock::now();
     const size_t spatial_merge_size = m_vision_encoder->get_processor_config().merge_size;
     const size_t tokens_per_second = m_vlm_config.vision_config_tokens_per_second;
 
@@ -1571,6 +1604,9 @@ ov::Tensor InputsEmbedderQwen2VL::create_position_ids(
             next_pos++;
         }
     }
+    auto cp1 = std::chrono::steady_clock::now();
+    std::cout << "[TIMING] create_position_ids (seq_len=" << seq_len
+              << "): " << std::chrono::duration_cast<std::chrono::microseconds>(cp1 - cp0).count() << " us" << std::endl;
 
     return position_ids;
 }
