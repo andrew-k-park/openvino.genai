@@ -4,6 +4,9 @@
 #include "visual_language/qwen3_vl/classes.hpp"
 #include "utils.hpp"
 
+#include <chrono>
+#include <iostream>
+
 namespace ov::genai {
 
 namespace {
@@ -380,6 +383,9 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     const std::vector<EncodedVideo>& videos,
     const std::vector<size_t>& videos_sequence
 ) {
+    auto merger_start = std::chrono::steady_clock::now();
+    auto sub_start = merger_start;
+
     auto [reordered_image_embeds, reordered_images_grid_thw] = 
         qwen2_vl_utils::reorder_image_embeds_and_grid_thw(images, images_sequence);
     auto [reordered_video_embeds, reordered_videos_grid_thw] = 
@@ -387,6 +393,10 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     
     ov::Tensor concatenated_embeds = 
         qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds);
+
+    auto sub_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] reorder + concatenate embeds: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(sub_end - sub_start).count() << " us" << std::endl;
     
     // Combined grid for position computation
     std::vector<std::array<size_t, 3>> combined_grid_thw;
@@ -395,6 +405,7 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     combined_grid_thw.insert(combined_grid_thw.end(), 
         reordered_images_grid_thw.begin(), reordered_images_grid_thw.end());
     
+    sub_start = std::chrono::steady_clock::now();
     if (!combined_grid_thw.empty()) {
         ov::Tensor pos_embeds = get_interpolated_pos_embeds(combined_grid_thw);
         
@@ -404,9 +415,17 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
             concatenated_embeds_data[i] += pos_embeds_data[i];
         }
     }
+    sub_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] get_interpolated_pos_embeds + add: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(sub_end - sub_start).count() << " us" << std::endl;
     
+    sub_start = std::chrono::steady_clock::now();
     ov::Tensor rotary_pos_emb = get_rotary_pos_emb(combined_grid_thw);
+    sub_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] get_rotary_pos_emb: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(sub_end - sub_start).count() << " us" << std::endl;
     
+    sub_start = std::chrono::steady_clock::now();
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
     
@@ -422,7 +441,11 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
     vision_embeddings_merger.infer();
+    sub_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] vision_embeddings_merger infer: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(sub_end - sub_start).count() << " us" << std::endl;
     
+    sub_start = std::chrono::steady_clock::now();
     ov::Tensor vision_embeds = vision_embeddings_merger.get_tensor("last_hidden_state");
     m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
     
@@ -446,6 +469,13 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     std::memcpy(image_embeds.data(),
                 static_cast<uint8_t*>(vision_embeds.data()) + video_embeds.get_byte_size(),
                 image_embeds.get_byte_size());
+    sub_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] split vision embeddings: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(sub_end - sub_start).count() << " us" << std::endl;
+
+    auto merger_end = std::chrono::steady_clock::now();
+    std::cout << "  [merger] total: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(merger_end - merger_start).count() << " us" << std::endl;
     
     return {video_embeds, image_embeds};
 }
@@ -496,6 +526,9 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     const std::vector<size_t>& videos_sequence,
     const std::vector<std::pair<std::size_t, std::size_t>>& history_vision_count
 ) {
+    auto perf_start = std::chrono::steady_clock::now();
+    auto block_start = perf_start;
+
     std::vector<std::array<size_t, 3>> images_grid_thw;
     images_grid_thw.reserve(images.size());
     for (const auto& encoded_image : images) {
@@ -516,18 +549,35 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
         });
     }
 
+    auto block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] grid_thw preparation: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
+
+    block_start = std::chrono::steady_clock::now();
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] get_encoded_input_ids: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
+
+    block_start = std::chrono::steady_clock::now();
     CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
     EmbeddingsRequest& req = embeddings_request_guard.get();
     ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] text_embedding infer: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
 
     int64_t vision_start_token_id = m_vision_token_ids.at("vision_start");
     int64_t image_pad_token_id = m_vision_token_ids.at("image_pad");
     int64_t video_pad_token_id = m_vision_token_ids.at("video_pad");
 
+    block_start = std::chrono::steady_clock::now();
     m_position_ids = create_position_ids(input_ids, images_grid_thw, images_sequence, 0, 
                                          videos_grid_thw, videos_sequence, 0, 
                                          vision_start_token_id, history_vision_count);
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] create_position_ids: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
 
     int64_t position_ids_max = *std::max_element(m_position_ids.data<int64_t>(), 
                                                  m_position_ids.data<int64_t>() + m_position_ids.get_size());
@@ -549,19 +599,42 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
 
         ov::Tensor inputs_embeds(text_embeds.get_element_type(), text_embeds.get_shape());
         std::memcpy(inputs_embeds.data(), text_embeds.data(), text_embeds.get_byte_size());
+
+        auto perf_end = std::chrono::steady_clock::now();
+        std::cout << "[Qwen3VL get_inputs_embeds] total (no vision): "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(perf_end - perf_start).count() << " us" << std::endl;
         return inputs_embeds;
     }
 
+    block_start = std::chrono::steady_clock::now();
     if (recalculate_merged_embeddings) {
         std::tie(m_merged_video_embeddings, m_merged_image_embeddings) = 
             run_video_image_embeddings_merger(images, images_sequence, videos, videos_sequence);
     }
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] run_video_image_embeddings_merger: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us"
+              << (recalculate_merged_embeddings ? "" : " (skipped)") << std::endl;
 
+    block_start = std::chrono::steady_clock::now();
     m_lm_extra_inputs["visual_pos_masks"] = create_visual_pos_masks(input_ids, image_pad_token_id, video_pad_token_id);
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] create_visual_pos_masks: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
 
-    return qwen2_vl_utils::merge_text_and_video_image_embeddings(
+    block_start = std::chrono::steady_clock::now();
+    auto result = qwen2_vl_utils::merge_text_and_video_image_embeddings(
         input_ids, text_embeds, m_merged_image_embeddings, m_merged_video_embeddings,
         image_pad_token_id, video_pad_token_id);
+    block_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] merge_text_and_video_image_embeddings: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(block_end - block_start).count() << " us" << std::endl;
+
+    auto perf_end = std::chrono::steady_clock::now();
+    std::cout << "[Qwen3VL get_inputs_embeds] total: "
+              << std::chrono::duration_cast<std::chrono::microseconds>(perf_end - perf_start).count() << " us" << std::endl;
+
+    return result;
 }
 
 void InputsEmbedderQwen3VL::start_chat(const std::string& system_message) {
