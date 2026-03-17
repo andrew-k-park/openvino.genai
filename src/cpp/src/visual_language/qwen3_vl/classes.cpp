@@ -181,6 +181,10 @@ ov::Tensor permute_with_spatial_merge(
         const size_t hw = h * w;
         const size_t merge_h = h / spatial_merge_size;
         const size_t merge_w = w / spatial_merge_size;
+        OPENVINO_ASSERT(
+            h % spatial_merge_size == 0 && w % spatial_merge_size == 0,
+            "permute_with_spatial_merge expects h and w divisible by spatial_merge_size. "
+            "Got h=", h, ", w=", w, ", spatial_merge_size=", spatial_merge_size);
 
         for (size_t ti = 0; ti < t; ++ti) {
             for (size_t mhi = 0; mhi < merge_h; ++mhi) {
@@ -202,6 +206,10 @@ ov::Tensor permute_with_spatial_merge(
         }
         src_offset += t * hw;
     }
+    OPENVINO_ASSERT(
+        dst_offset == num_positions,
+        "permute_with_spatial_merge wrote ", dst_offset,
+        " positions, but num_positions is ", num_positions);
     return result;
 }
 
