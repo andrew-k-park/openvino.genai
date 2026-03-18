@@ -5,6 +5,9 @@
 #include "visual_language/chat_history_state.hpp"
 #include "visual_language/vlm_chat_context.hpp"
 
+#include <iostream>
+#include <iomanip>
+
 namespace {
 
 std::unordered_map<std::string, ov::Tensor> deep_copy_tensors_map(
@@ -14,7 +17,18 @@ std::unordered_map<std::string, ov::Tensor> deep_copy_tensors_map(
     dst.reserve(src.size());
     for (const auto& [name, tensor] : src) {
         ov::Tensor tensor_copy(tensor.get_element_type(), tensor.get_shape());
+        auto copy_start = std::chrono::steady_clock::now();
         tensor.copy_to(tensor_copy);
+        auto copy_end = std::chrono::steady_clock::now();
+        double copy_ms = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+        auto shape = tensor.get_shape();
+        std::cerr << "[CB_VLM_PERF] deep_copy tensor \"" << name << "\" shape=[";
+        for (size_t i = 0; i < shape.size(); ++i) {
+            if (i > 0) std::cerr << ",";
+            std::cerr << shape[i];
+        }
+        std::cerr << "] " << tensor.get_byte_size() / 1024 << "KB, copy=" 
+                  << std::fixed << std::setprecision(2) << copy_ms << "ms" << std::endl;
         dst.emplace(name, std::move(tensor_copy));
     }
     return dst;
@@ -303,13 +317,17 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         const auto& prompt = prompts[0];
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
 
+        auto t0 = std::chrono::steady_clock::now();
         encoded_images = m_inputs_embedder->encode_images(images_vector[0]);
+        auto t1 = std::chrono::steady_clock::now();
         m_history_images.insert(m_history_images.end(), encoded_images.begin(), encoded_images.end());
 
         encoded_videos = m_inputs_embedder->encode_videos(videos_vector[0]);
+        auto t2 = std::chrono::steady_clock::now();
         m_history_videos.insert(m_history_videos.end(), encoded_videos.begin(), encoded_videos.end());
 
         auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+        auto t3 = std::chrono::steady_clock::now();
 
         m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
         m_history_image_ids.insert(m_history_image_ids.end(), image_sequence.begin(), image_sequence.end());
@@ -317,6 +335,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         m_history_vision_count.emplace_back(std::make_pair(video_sequence.size(), image_sequence.size()));
 
         std::string templated_history = m_tokenizer.apply_chat_template(m_history, true);
+        auto t4 = std::chrono::steady_clock::now();
 
         m_inputs_embedder->set_apply_chat_template_status(false);
 
@@ -346,13 +365,28 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
                                                                                 m_history_video_ids,
                                                                                 m_history_vision_count));
         }
+        auto t5 = std::chrono::steady_clock::now();
 
         position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[0].get_shape()[1], 0));
+        auto t6 = std::chrono::steady_clock::now();
 
-        lm_extra_inputs_list.push_back(deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs()));
+        lm_extra_inputs_list.push_back(m_inputs_embedder->take_lm_extra_inputs());
+        auto t7 = std::chrono::steady_clock::now();
 
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
         vlm_perf_metrics[0].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
+
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::cerr << "\n[CB_VLM_PERF][chat] encode_images: " << std::fixed << std::setprecision(2) << to_ms(t1 - t0) << " ms"
+                  << ", encode_videos: " << to_ms(t2 - t1) << " ms"
+                  << ", normalize_prompt: " << to_ms(t3 - t2) << " ms"
+                  << ", apply_chat_template: " << to_ms(t4 - t3) << " ms"
+                  << ", get_inputs_embeds: " << to_ms(t5 - t4) << " ms"
+                  << ", get_position_ids: " << to_ms(t6 - t5) << " ms"
+                  << ", deep_copy_extra_inputs: " << to_ms(t7 - t6) << " ms"
+                  << ", TOTAL_prepare: " << to_ms(t7 - t0) << " ms" << std::endl;
 
     } else {
         for (size_t i = 0; i < prompts.size(); i++) {
@@ -361,10 +395,15 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             
             auto images_to_encode = images_vector.size() > 0 ? images_vector[i] : std::vector<ov::Tensor>{};
             auto videos_to_encode = videos_vector.size() > 0 ? videos_vector[i] : std::vector<ov::Tensor>{};
+
+            auto t0 = std::chrono::steady_clock::now();
             const auto encoded_images = m_inputs_embedder->encode_images(images_to_encode);
+            auto t1 = std::chrono::steady_clock::now();
             const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
+            auto t2 = std::chrono::steady_clock::now();
 
             auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+            auto t3 = std::chrono::steady_clock::now();
 
             m_inputs_embedder->set_apply_chat_template_status(sampling_params[i].apply_chat_template);
 
@@ -386,16 +425,31 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             } else {
                 input_embeds_list.emplace_back(m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, encoded_videos, vlm_perf_metrics[i], recalculate_merged_embeddings, image_sequence, video_sequence));
             }
+            auto t4 = std::chrono::steady_clock::now();
 
             position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[i].get_shape()[1], 0));
+            auto t5 = std::chrono::steady_clock::now();
 
-            lm_extra_inputs_list.push_back(deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs()));
+            lm_extra_inputs_list.push_back(m_inputs_embedder->take_lm_extra_inputs());
+            auto t6 = std::chrono::steady_clock::now();
         
             auto end_get_inputs_embeds = std::chrono::steady_clock::now();
             vlm_perf_metrics[i].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
+
+            auto to_ms = [](std::chrono::steady_clock::duration d) {
+                return std::chrono::duration<double, std::milli>(d).count();
+            };
+            std::cerr << "\n[CB_VLM_PERF][non-chat][" << i << "] encode_images: " << std::fixed << std::setprecision(2) << to_ms(t1 - t0) << " ms"
+                      << ", encode_videos: " << to_ms(t2 - t1) << " ms"
+                      << ", normalize_prompt: " << to_ms(t3 - t2) << " ms"
+                      << ", get_inputs_embeds: " << to_ms(t4 - t3) << " ms"
+                      << ", get_position_ids: " << to_ms(t5 - t4) << " ms"
+                      << ", deep_copy_extra_inputs: " << to_ms(t6 - t5) << " ms"
+                      << ", TOTAL_prepare: " << to_ms(t6 - t0) << " ms" << std::endl;
         }
     }
     std::vector<VLMDecodedResults> results;
+    auto lm_gen_start = std::chrono::steady_clock::now();
     std::vector<EncodedGenerationResult> encoded_results = generate(input_embeds_list,
                                                                     sampling_params,
                                                                     streamer,
@@ -403,6 +457,14 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
                                                                     position_ids_list,
                                                                     original_prompt_ids_list,
                                                                     lm_extra_inputs_list);
+    auto lm_gen_end = std::chrono::steady_clock::now();
+    {
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::cerr << "[CB_VLM_PERF] LM_generate: " << std::fixed << std::setprecision(2) << to_ms(lm_gen_end - lm_gen_start) << " ms"
+                  << ", total_since_generate_entry: " << to_ms(lm_gen_end - generate_start_time) << " ms" << std::endl;
+    }
     for (size_t i = 0; i < prompts.size(); i++) {
         auto result = encoded_results[i];
         VLMDecodedResults gen_result;
@@ -533,7 +595,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
 
         position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[i].get_shape()[1], 0));
 
-        lm_extra_inputs_list.push_back(deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs()));
+        lm_extra_inputs_list.push_back(m_inputs_embedder->take_lm_extra_inputs());
     
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
         vlm_perf_metrics[i].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
@@ -604,7 +666,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(uint64_t re
         } else {
             inputs = m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, metrics, true, image_sequence);
         }
-        lm_extra_inputs = deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs());
+        lm_extra_inputs = m_inputs_embedder->take_lm_extra_inputs();
     }
     return add_request(request_id, inputs, sampling_params, token_type_ids, prompt_ids, lm_extra_inputs);
 }
@@ -632,7 +694,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::add_request(
 
         const auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, 0, 0, encoded_images, encoded_videos);
         inputs = m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, encoded_videos, metrics, true, image_sequence, video_sequence);
-        lm_extra_inputs = deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs());
+        lm_extra_inputs = m_inputs_embedder->take_lm_extra_inputs();
     }
     return add_request(request_id, inputs, std::move(sampling_params), token_type_ids, prompt_ids, lm_extra_inputs);
 }

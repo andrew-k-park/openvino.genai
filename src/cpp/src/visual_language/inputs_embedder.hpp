@@ -72,6 +72,8 @@ public:
 
     const std::unordered_map<std::string, ov::Tensor>& get_lm_extra_inputs() const;
 
+    std::unordered_map<std::string, ov::Tensor> take_lm_extra_inputs();
+
     std::vector<ov::genai::EncodedImage> encode_images(const std::vector<ov::Tensor>& images);
 
     std::vector<ov::genai::EncodedVideo> encode_videos(const std::vector<ov::Tensor>& videos);
@@ -194,6 +196,9 @@ private:
         virtual bool has_token_type_ids() const;
 
         virtual const std::unordered_map<std::string, ov::Tensor>& get_lm_extra_inputs() const;
+
+        // Move lm_extra_inputs out, avoiding deep copy. Caller takes ownership.
+        virtual std::unordered_map<std::string, ov::Tensor> take_lm_extra_inputs();
 
         virtual std::vector<ov::genai::EncodedImage> encode_images(const std::vector<ov::Tensor>& images);
 

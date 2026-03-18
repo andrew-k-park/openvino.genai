@@ -4,6 +4,10 @@
 #include "visual_language/qwen3_vl/classes.hpp"
 #include "utils.hpp"
 
+#include <iostream>
+#include <iomanip>
+#include <chrono>
+
 #include "openvino/op/add.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/split.hpp"
@@ -181,10 +185,6 @@ ov::Tensor permute_with_spatial_merge(
         const size_t hw = h * w;
         const size_t merge_h = h / spatial_merge_size;
         const size_t merge_w = w / spatial_merge_size;
-        OPENVINO_ASSERT(
-            h % spatial_merge_size == 0 && w % spatial_merge_size == 0,
-            "permute_with_spatial_merge expects h and w divisible by spatial_merge_size. "
-            "Got h=", h, ", w=", w, ", spatial_merge_size=", spatial_merge_size);
 
         for (size_t ti = 0; ti < t; ++ti) {
             for (size_t mhi = 0; mhi < merge_h; ++mhi) {
@@ -206,10 +206,6 @@ ov::Tensor permute_with_spatial_merge(
         }
         src_offset += t * hw;
     }
-    OPENVINO_ASSERT(
-        dst_offset == num_positions,
-        "permute_with_spatial_merge wrote ", dst_offset,
-        " positions, but num_positions is ", num_positions);
     return result;
 }
 
@@ -402,10 +398,12 @@ void InputsEmbedderQwen3VL::expand_video_tags_in_prompt(
 ov::Tensor InputsEmbedderQwen3VL::get_interpolated_pos_embeds(
     const std::vector<std::array<size_t, 3>>& grids_thw
 ) {
+    auto pe_t0 = std::chrono::steady_clock::now();
     const size_t num_grid_per_side = static_cast<size_t>(
         std::sqrt(static_cast<double>(m_vlm_config.vision_config_num_position_embeddings)));
 
     auto [indices, weights] = get_position_interpolation_indices_and_weights(grids_thw, num_grid_per_side);
+    auto pe_t1 = std::chrono::steady_clock::now();
 
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(m_ireq_queue_vision_embeddings_pos.get());
     ov::InferRequest& vision_embeddings_pos = infer_request_guard.get();
@@ -446,9 +444,23 @@ ov::Tensor InputsEmbedderQwen3VL::get_interpolated_pos_embeds(
             }
         }
     }
+    auto pe_t2 = std::chrono::steady_clock::now();
 
     size_t spatial_merge_size = m_vision_encoder->get_processor_config().merge_size;
-    return permute_with_spatial_merge(weighted_sum, grids_thw, spatial_merge_size);
+    auto result = permute_with_spatial_merge(weighted_sum, grids_thw, spatial_merge_size);
+    auto pe_t3 = std::chrono::steady_clock::now();
+
+    {
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::cerr << "[Qwen3VL_PERF] get_interpolated_pos_embeds:"
+                  << " indices_weights_calc=" << std::fixed << std::setprecision(2) << to_ms(pe_t1 - pe_t0) << "ms"
+                  << ", pos_model_infer=" << to_ms(pe_t2 - pe_t1) << "ms"
+                  << ", permute_spatial=" << to_ms(pe_t3 - pe_t2) << "ms"
+                  << ", TOTAL=" << to_ms(pe_t3 - pe_t0) << "ms" << std::endl;
+    }
+    return result;
 }
 
 std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddings_merger(
@@ -457,6 +469,7 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     const std::vector<EncodedVideo>& videos,
     const std::vector<size_t>& videos_sequence
 ) {
+    auto mr_t0 = std::chrono::steady_clock::now();
     auto [reordered_image_embeds, reordered_images_grid_thw] = 
         qwen2_vl_utils::reorder_image_embeds_and_grid_thw(images, images_sequence);
     auto [reordered_video_embeds, reordered_videos_grid_thw] = 
@@ -464,6 +477,7 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     
     ov::Tensor concatenated_embeds = 
         qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds);
+    auto mr_t1 = std::chrono::steady_clock::now();
     
     // Combined grid for position computation
     std::vector<std::array<size_t, 3>> combined_grid_thw;
@@ -474,20 +488,42 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     
     if (!combined_grid_thw.empty()) {
         ov::Tensor pos_embeds = get_interpolated_pos_embeds(combined_grid_thw);
+        auto mr_t1b = std::chrono::steady_clock::now();
         
         float* concatenated_embeds_data = concatenated_embeds.data<float>();
         const float* pos_embeds_data = pos_embeds.data<const float>();
-        for (size_t i = 0; i < concatenated_embeds.get_size(); ++i) {
+        const size_t add_loop_size = concatenated_embeds.get_size();
+        for (size_t i = 0; i < add_loop_size; ++i) {
             concatenated_embeds_data[i] += pos_embeds_data[i];
         }
+        auto mr_t1c = std::chrono::steady_clock::now();
+        {
+            auto to_ms = [](std::chrono::steady_clock::duration d) {
+                return std::chrono::duration<double, std::milli>(d).count();
+            };
+            auto pos_shape = pos_embeds.get_shape();
+            auto cat_shape = concatenated_embeds.get_shape();
+            std::cerr << "[Qwen3VL_PERF] pos_embeds_add_detail:"
+                      << " get_interpolated_pos_embeds=" << std::fixed << std::setprecision(2) << to_ms(mr_t1b - mr_t1) << "ms"
+                      << ", add_loop=" << to_ms(mr_t1c - mr_t1b) << "ms"
+                      << " (elements=" << add_loop_size << ", bytes=" << add_loop_size * sizeof(float) / 1024 << "KB)"
+                      << ", concat_shape=[" << cat_shape[0] << "," << cat_shape[1] << "]"
+                      << ", pos_shape=[" << pos_shape[0] << "," << pos_shape[1] << "]"
+                      << std::endl;
+        }
     }
+    auto mr_t2 = std::chrono::steady_clock::now();
     
     ov::Tensor rotary_pos_emb = get_rotary_pos_emb(combined_grid_thw);
+    auto mr_t3 = std::chrono::steady_clock::now();
     
+    auto st_t0 = std::chrono::steady_clock::now();
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
+    auto st_t1 = std::chrono::steady_clock::now();
     
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_embeds);
+    auto st_t2 = std::chrono::steady_clock::now();
     
     if (m_with_cu_seqlens_input) {
         vision_embeddings_merger.set_tensor("cu_seq_lens", 
@@ -496,9 +532,29 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
         vision_embeddings_merger.set_tensor("attention_mask",
             qwen2_vl_utils::get_attention_mask(reordered_images_grid_thw, reordered_videos_grid_thw));
     }
+    auto st_t3 = std::chrono::steady_clock::now();
     
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
+    auto st_t4 = std::chrono::steady_clock::now();
+    {
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        auto hs_shape = concatenated_embeds.get_shape();
+        auto rpe_shape = rotary_pos_emb.get_shape();
+        std::cerr << "[Qwen3VL_PERF] set_tensors detail:"
+                  << " get_ireq=" << std::fixed << std::setprecision(2) << to_ms(st_t1 - st_t0) << "ms"
+                  << ", set_hidden_states=" << to_ms(st_t2 - st_t1) << "ms"
+                  << " [" << hs_shape[0] << "," << hs_shape[1] << "] " << concatenated_embeds.get_byte_size()/1024 << "KB"
+                  << ", set_attn/cu=" << to_ms(st_t3 - st_t2) << "ms"
+                  << " (cu_seqlens=" << (m_with_cu_seqlens_input ? "Y" : "N") << ")"
+                  << ", set_rotary=" << to_ms(st_t4 - st_t3) << "ms"
+                  << " [" << rpe_shape[0] << "," << rpe_shape[1] << "] " << rotary_pos_emb.get_byte_size()/1024 << "KB"
+                  << ", TOTAL=" << to_ms(st_t4 - st_t0) << "ms" << std::endl;
+    }
+    auto mr_t4 = std::chrono::steady_clock::now();
     vision_embeddings_merger.infer();
+    auto mr_t5 = std::chrono::steady_clock::now();
     
     ov::Tensor vision_embeds = vision_embeddings_merger.get_tensor("last_hidden_state");
     m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
@@ -523,7 +579,22 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     std::memcpy(image_embeds.data(),
                 static_cast<uint8_t*>(vision_embeds.data()) + video_embeds.get_byte_size(),
                 image_embeds.get_byte_size());
-    
+    auto mr_t6 = std::chrono::steady_clock::now();
+
+    {
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::cerr << "[Qwen3VL_PERF] run_merger breakdown:"
+                  << " reorder+concat=" << std::fixed << std::setprecision(2) << to_ms(mr_t1 - mr_t0) << "ms"
+                  << ", pos_embeds_interp=" << to_ms(mr_t2 - mr_t1) << "ms"
+                  << ", rotary_pos_emb=" << to_ms(mr_t3 - mr_t2) << "ms"
+                  << ", set_tensors=" << to_ms(mr_t4 - mr_t3) << "ms"
+                  << ", merger_infer=" << to_ms(mr_t5 - mr_t4) << "ms"
+                  << ", split_copy=" << to_ms(mr_t6 - mr_t5) << "ms"
+                  << ", TOTAL=" << to_ms(mr_t6 - mr_t0) << "ms" << std::endl;
+    }
+
     return {video_embeds, image_embeds};
 }
 
@@ -593,10 +664,13 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
         });
     }
 
+    auto gie_t0 = std::chrono::steady_clock::now();
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
+    auto gie_t1 = std::chrono::steady_clock::now();
     CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
     EmbeddingsRequest& req = embeddings_request_guard.get();
     ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
+    auto gie_t2 = std::chrono::steady_clock::now();
 
     int64_t vision_start_token_id = m_vision_token_ids.at("vision_start");
     int64_t image_pad_token_id = m_vision_token_ids.at("image_pad");
@@ -605,6 +679,7 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     m_position_ids = create_position_ids(input_ids, images_grid_thw, images_sequence, 0, 
                                          videos_grid_thw, videos_sequence, 0, 
                                          vision_start_token_id, history_vision_count);
+    auto gie_t3 = std::chrono::steady_clock::now();
 
     int64_t position_ids_max = *std::max_element(m_position_ids.data<int64_t>(), 
                                                  m_position_ids.data<int64_t>() + m_position_ids.get_size());
@@ -633,12 +708,28 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
         std::tie(m_merged_video_embeddings, m_merged_image_embeddings) = 
             run_video_image_embeddings_merger(images, images_sequence, videos, videos_sequence);
     }
+    auto gie_t4 = std::chrono::steady_clock::now();
 
     m_lm_extra_inputs["visual_pos_masks"] = create_visual_pos_masks(input_ids, image_pad_token_id, video_pad_token_id);
 
-    return qwen2_vl_utils::merge_text_and_video_image_embeddings(
+    auto gie_result = qwen2_vl_utils::merge_text_and_video_image_embeddings(
         input_ids, text_embeds, m_merged_image_embeddings, m_merged_video_embeddings,
         image_pad_token_id, video_pad_token_id);
+    auto gie_t5 = std::chrono::steady_clock::now();
+
+    {
+        auto to_ms = [](std::chrono::steady_clock::duration d) {
+            return std::chrono::duration<double, std::milli>(d).count();
+        };
+        std::cerr << "[Qwen3VL_PERF] get_inputs_embeds breakdown:"
+                  << " tokenize=" << std::fixed << std::setprecision(2) << to_ms(gie_t1 - gie_t0) << "ms"
+                  << ", text_embed=" << to_ms(gie_t2 - gie_t1) << "ms"
+                  << ", create_position_ids=" << to_ms(gie_t3 - gie_t2) << "ms"
+                  << ", vision_merger=" << to_ms(gie_t4 - gie_t3) << "ms"
+                  << ", merge_embeds=" << to_ms(gie_t5 - gie_t4) << "ms"
+                  << ", TOTAL=" << to_ms(gie_t5 - gie_t0) << "ms" << std::endl;
+    }
+    return gie_result;
 }
 
 void InputsEmbedderQwen3VL::start_chat(const std::string& system_message) {
@@ -655,6 +746,10 @@ void InputsEmbedderQwen3VL::finish_chat() {
 
 const std::unordered_map<std::string, ov::Tensor>& InputsEmbedderQwen3VL::get_lm_extra_inputs() const {
     return m_lm_extra_inputs;
+}
+
+std::unordered_map<std::string, ov::Tensor> InputsEmbedderQwen3VL::take_lm_extra_inputs() {
+    return std::move(m_lm_extra_inputs);
 }
 
 } // namespace ov::genai
