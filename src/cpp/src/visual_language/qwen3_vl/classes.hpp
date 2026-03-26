@@ -47,6 +47,8 @@ public:
 
     const std::unordered_map<std::string, ov::Tensor>& get_lm_extra_inputs() const override;
 
+    std::unordered_map<std::string, ov::Tensor> take_lm_extra_inputs() override;
+
     void start_chat(const std::string& system_message) override;
 
     void finish_chat() override;
