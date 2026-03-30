@@ -5,6 +5,55 @@
 #include "visual_language/chat_history_state.hpp"
 #include "visual_language/vlm_chat_context.hpp"
 
+// ===== TTFT CPU/GPU Profiling =====
+#include <iostream>
+#include <iomanip>
+static bool s_ttft_profile_enabled = []() {
+    const char* env = std::getenv("OV_VLM_TTFT_PROFILE");
+    return env && std::string(env) == "1";
+}();
+
+struct TTFTProfiler {
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+    using Duration = std::chrono::duration<double, std::milli>;
+
+    double encode_images_ms = 0;
+    double encode_videos_ms = 0;
+    double normalize_prompt_ms = 0;
+    double apply_chat_template_ms = 0;
+    double get_inputs_embeds_ms = 0;
+    double get_position_ids_ms = 0;
+    double deep_copy_tensors_ms = 0;
+    double total_ms = 0;
+
+    void print(size_t prompt_idx = 0) const {
+        double gpu_ms = encode_images_ms + encode_videos_ms + get_inputs_embeds_ms;
+        double cpu_ms = normalize_prompt_ms + apply_chat_template_ms + get_position_ids_ms + deep_copy_tensors_ms;
+        double accounted = gpu_ms + cpu_ms;
+        double other_ms = total_ms - accounted;
+        if (other_ms < 0) other_ms = 0;
+
+        std::cerr << "\n========== TTFT CPU/GPU Profile (prompt " << prompt_idx << ") ==========\n";
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "  Total prepare_embeddings:    " << total_ms << " ms\n";
+        std::cerr << "  -----------------------------------------------\n";
+        std::cerr << "  [GPU] encode_images:         " << encode_images_ms << " ms\n";
+        std::cerr << "  [GPU] encode_videos:          " << encode_videos_ms << " ms\n";
+        std::cerr << "  [GPU*] get_inputs_embeds:     " << get_inputs_embeds_ms << " ms\n";
+        std::cerr << "         (includes GPU infers: text_embed, vision_pos, merger)\n";
+        std::cerr << "  [CPU] normalize_prompt:       " << normalize_prompt_ms << " ms\n";
+        std::cerr << "  [CPU] apply_chat_template:    " << apply_chat_template_ms << " ms\n";
+        std::cerr << "  [CPU] get_position_ids:       " << get_position_ids_ms << " ms\n";
+        std::cerr << "  [CPU] deep_copy_tensors:      " << deep_copy_tensors_ms << " ms\n";
+        std::cerr << "  [???] other/unaccounted:      " << other_ms << " ms\n";
+        std::cerr << "  -----------------------------------------------\n";
+        std::cerr << "  See get_inputs_embeds detailed breakdown above.\n";
+        std::cerr << "==========================================================\n";
+    }
+};
+// ===== End TTFT Profiling Structs =====
+
 namespace {
 
 std::unordered_map<std::string, ov::Tensor> deep_copy_tensors_map(
@@ -302,21 +351,34 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         OPENVINO_ASSERT(1 == prompts.size(), "Can't chat with multiple prompts");
         const auto& prompt = prompts[0];
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
+        TTFTProfiler prof;
 
+        auto t0 = TTFTProfiler::Clock::now();
         encoded_images = m_inputs_embedder->encode_images(images_vector[0]);
+        auto t1 = TTFTProfiler::Clock::now();
+        prof.encode_images_ms = TTFTProfiler::Duration(t1 - t0).count();
         m_history_images.insert(m_history_images.end(), encoded_images.begin(), encoded_images.end());
 
+        t0 = TTFTProfiler::Clock::now();
         encoded_videos = m_inputs_embedder->encode_videos(videos_vector[0]);
+        t1 = TTFTProfiler::Clock::now();
+        prof.encode_videos_ms = TTFTProfiler::Duration(t1 - t0).count();
         m_history_videos.insert(m_history_videos.end(), encoded_videos.begin(), encoded_videos.end());
 
+        t0 = TTFTProfiler::Clock::now();
         auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+        t1 = TTFTProfiler::Clock::now();
+        prof.normalize_prompt_ms = TTFTProfiler::Duration(t1 - t0).count();
 
         m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
         m_history_image_ids.insert(m_history_image_ids.end(), image_sequence.begin(), image_sequence.end());
         m_history_video_ids.insert(m_history_video_ids.end(), video_sequence.begin(), video_sequence.end());
         m_history_vision_count.emplace_back(std::make_pair(video_sequence.size(), image_sequence.size()));
 
+        t0 = TTFTProfiler::Clock::now();
         std::string templated_history = m_tokenizer.apply_chat_template(m_history, true);
+        t1 = TTFTProfiler::Clock::now();
+        prof.apply_chat_template_ms = TTFTProfiler::Duration(t1 - t0).count();
 
         m_inputs_embedder->set_apply_chat_template_status(false);
 
@@ -325,6 +387,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             original_prompt_ids_list.push_back(prompt_ids);
         }
 
+        t0 = TTFTProfiler::Clock::now();
         if (m_inputs_embedder->has_token_type_ids()) {
             auto [embeds, tt_ids] = m_inputs_embedder->get_inputs_embeds_with_token_type_ids(templated_history,
                                                                                              m_history_images,
@@ -346,25 +409,47 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
                                                                                 m_history_video_ids,
                                                                                 m_history_vision_count));
         }
+        t1 = TTFTProfiler::Clock::now();
+        prof.get_inputs_embeds_ms = TTFTProfiler::Duration(t1 - t0).count();
 
+        t0 = TTFTProfiler::Clock::now();
         position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[0].get_shape()[1], 0));
+        t1 = TTFTProfiler::Clock::now();
+        prof.get_position_ids_ms = TTFTProfiler::Duration(t1 - t0).count();
 
+        t0 = TTFTProfiler::Clock::now();
         lm_extra_inputs_list.push_back(deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs()));
+        t1 = TTFTProfiler::Clock::now();
+        prof.deep_copy_tensors_ms = TTFTProfiler::Duration(t1 - t0).count();
 
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
+        prof.total_ms = TTFTProfiler::Duration(end_get_inputs_embeds - start_get_inputs_embeds).count();
+        if (s_ttft_profile_enabled) prof.print(0);
         vlm_perf_metrics[0].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
 
     } else {
         for (size_t i = 0; i < prompts.size(); i++) {
             const auto& prompt = prompts[i];
             auto start_get_inputs_embeds = std::chrono::steady_clock::now();
-            
+            TTFTProfiler prof;
+
             auto images_to_encode = images_vector.size() > 0 ? images_vector[i] : std::vector<ov::Tensor>{};
             auto videos_to_encode = videos_vector.size() > 0 ? videos_vector[i] : std::vector<ov::Tensor>{};
-            const auto encoded_images = m_inputs_embedder->encode_images(images_to_encode);
-            const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
 
+            auto t0 = TTFTProfiler::Clock::now();
+            const auto encoded_images = m_inputs_embedder->encode_images(images_to_encode);
+            auto t1 = TTFTProfiler::Clock::now();
+            prof.encode_images_ms = TTFTProfiler::Duration(t1 - t0).count();
+
+            t0 = TTFTProfiler::Clock::now();
+            const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
+            t1 = TTFTProfiler::Clock::now();
+            prof.encode_videos_ms = TTFTProfiler::Duration(t1 - t0).count();
+
+            t0 = TTFTProfiler::Clock::now();
             auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+            t1 = TTFTProfiler::Clock::now();
+            prof.normalize_prompt_ms = TTFTProfiler::Duration(t1 - t0).count();
 
             m_inputs_embedder->set_apply_chat_template_status(sampling_params[i].apply_chat_template);
 
@@ -373,6 +458,7 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
                 original_prompt_ids_list.push_back(prompt_ids);
             }
 
+            t0 = TTFTProfiler::Clock::now();
             if (m_inputs_embedder->has_token_type_ids()) {
                 auto [embeds, tt_ids] = m_inputs_embedder->get_inputs_embeds_with_token_type_ids(unified_prompt,
                                                                                                  encoded_images,
@@ -386,12 +472,22 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             } else {
                 input_embeds_list.emplace_back(m_inputs_embedder->get_inputs_embeds(unified_prompt, encoded_images, encoded_videos, vlm_perf_metrics[i], recalculate_merged_embeddings, image_sequence, video_sequence));
             }
+            t1 = TTFTProfiler::Clock::now();
+            prof.get_inputs_embeds_ms = TTFTProfiler::Duration(t1 - t0).count();
 
+            t0 = TTFTProfiler::Clock::now();
             position_ids_list.push_back(m_inputs_embedder->get_position_ids(input_embeds_list[i].get_shape()[1], 0));
+            t1 = TTFTProfiler::Clock::now();
+            prof.get_position_ids_ms = TTFTProfiler::Duration(t1 - t0).count();
 
+            t0 = TTFTProfiler::Clock::now();
             lm_extra_inputs_list.push_back(deep_copy_tensors_map(m_inputs_embedder->get_lm_extra_inputs()));
+            t1 = TTFTProfiler::Clock::now();
+            prof.deep_copy_tensors_ms = TTFTProfiler::Duration(t1 - t0).count();
         
             auto end_get_inputs_embeds = std::chrono::steady_clock::now();
+            prof.total_ms = TTFTProfiler::Duration(end_get_inputs_embeds - start_get_inputs_embeds).count();
+            if (s_ttft_profile_enabled) prof.print(i);
             vlm_perf_metrics[i].vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
         }
     }
