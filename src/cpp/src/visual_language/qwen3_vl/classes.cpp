@@ -578,4 +578,8 @@ const std::unordered_map<std::string, ov::Tensor>& InputsEmbedderQwen3VL::get_lm
     return m_lm_extra_inputs;
 }
 
+std::unordered_map<std::string, ov::Tensor> InputsEmbedderQwen3VL::take_lm_extra_inputs() {
+    return std::move(m_lm_extra_inputs);
+}
+
 } // namespace ov::genai
