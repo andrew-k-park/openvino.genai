@@ -265,6 +265,10 @@ const std::unordered_map<std::string, ov::Tensor>& InputsEmbedder::IInputsEmbedd
     return empty_map;
 }
 
+std::unordered_map<std::string, ov::Tensor> InputsEmbedder::IInputsEmbedder::take_lm_extra_inputs() {
+    return {};
+}
+
 /// Public InputsEmbedder class
 
 InputsEmbedder::InputsEmbedder(const std::filesystem::path& model_dir,
@@ -398,6 +402,10 @@ bool InputsEmbedder::has_token_type_ids() const {
 
 const std::unordered_map<std::string, ov::Tensor>& InputsEmbedder::get_lm_extra_inputs() const {
     return m_impl->get_lm_extra_inputs();
+}
+
+std::unordered_map<std::string, ov::Tensor> InputsEmbedder::take_lm_extra_inputs() {
+    return m_impl->take_lm_extra_inputs();
 }
 
 std::vector<ov::genai::EncodedImage> InputsEmbedder::encode_images(const std::vector<ov::Tensor>& images) {
