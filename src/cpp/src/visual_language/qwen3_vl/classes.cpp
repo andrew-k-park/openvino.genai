@@ -1,6 +1,8 @@
 // Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
+#include <utility>
+
 #include "visual_language/qwen3_vl/classes.hpp"
 #include "utils.hpp"
 
@@ -579,7 +581,7 @@ const std::unordered_map<std::string, ov::Tensor>& InputsEmbedderQwen3VL::get_lm
 }
 
 std::unordered_map<std::string, ov::Tensor> InputsEmbedderQwen3VL::take_lm_extra_inputs() {
-    return std::move(m_lm_extra_inputs);
+    return std::exchange(m_lm_extra_inputs, {});
 }
 
 } // namespace ov::genai
