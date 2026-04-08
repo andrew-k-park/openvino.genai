@@ -271,6 +271,20 @@ def run_visual_language_generation_genai(
         batch_size=args['batch_size'],
         prompt_idx=prompt_index
     )
+    # Print EmbedPrep sub-model breakdown if available
+    vlm_raw = perf_metrics.vlm_raw_metrics
+    text_embed_us = vlm_raw.text_embed_durations
+    pos_embed_us = vlm_raw.pos_embed_durations
+    merger_us = vlm_raw.merger_durations
+    vision_enc_us = vlm_raw.vision_encoder_durations
+    if text_embed_us or pos_embed_us or merger_us or vision_enc_us:
+        iter_str = 'warm-up' if num == 0 else str(num)
+        prefix = f'[{iter_str}][P{prompt_index}]'
+        te = f'{text_embed_us[-1] / 1000.0:.2f}ms' if text_embed_us else 'N/A'
+        pe = f'{pos_embed_us[-1] / 1000.0:.2f}ms' if pos_embed_us else 'N/A'
+        mg = f'{merger_us[-1] / 1000.0:.2f}ms' if merger_us else 'N/A'
+        ve = f'{vision_enc_us[-1] / 1000.0:.2f}ms' if vision_enc_us else 'N/A'
+        log.info(f'{prefix} EmbedPrep breakdown: VisionEncoder: {ve}, TextEmbed: {te}, PosEmbed: {pe}, Merger: {mg}')
     if num > 0:
         prev_md5 = md5_list[num - 1][prompt_index]
         if result_md5_list != prev_md5:

@@ -342,7 +342,10 @@ ov::Tensor InputsEmbedderQwen3VL::get_interpolated_pos_embeds(
     ov::InferRequest& vision_embeddings_pos = infer_request_guard.get();
 
     vision_embeddings_pos.set_tensor("input", indices);
+    auto pos_embed_start = std::chrono::steady_clock::now();
     vision_embeddings_pos.infer();
+    m_last_pos_embed_duration = MicroSeconds(PerfMetrics::get_microsec(
+        std::chrono::steady_clock::now() - pos_embed_start));
     ov::Tensor pos_embeds = vision_embeddings_pos.get_output_tensor();
 
     size_t num_positions = pos_embeds.get_shape()[1];
@@ -419,8 +422,11 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     }
     
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
+    auto merger_start = std::chrono::steady_clock::now();
     vision_embeddings_merger.infer();
-    
+    m_last_merger_duration = MicroSeconds(PerfMetrics::get_microsec(
+        std::chrono::steady_clock::now() - merger_start));
+
     ov::Tensor vision_embeds = vision_embeddings_merger.get_tensor("last_hidden_state");
     m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
     
@@ -517,7 +523,10 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     ov::Tensor input_ids = get_encoded_input_ids(unified_prompt, metrics);
     CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
     EmbeddingsRequest& req = embeddings_request_guard.get();
+    auto text_embed_start = std::chrono::steady_clock::now();
     ov::Tensor text_embeds = m_embedding->infer(req, input_ids);
+    metrics.vlm_raw_metrics.text_embed_durations.emplace_back(
+        MicroSeconds(PerfMetrics::get_microsec(std::chrono::steady_clock::now() - text_embed_start)));
 
     int64_t vision_start_token_id = m_vision_token_ids.at("vision_start");
     int64_t image_pad_token_id = m_vision_token_ids.at("image_pad");
@@ -553,6 +562,13 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     if (recalculate_merged_embeddings) {
         std::tie(m_merged_video_embeddings, m_merged_image_embeddings) = 
             run_video_image_embeddings_merger(images, images_sequence, videos, videos_sequence);
+        metrics.vlm_raw_metrics.pos_embed_durations.emplace_back(m_last_pos_embed_duration);
+        metrics.vlm_raw_metrics.merger_durations.emplace_back(m_last_merger_duration);
+        // Collect accumulated vision encoder infer time (may span multiple frames)
+        if (auto* enc = dynamic_cast<VisionEncoderQwen2VL*>(m_vision_encoder.get())) {
+            metrics.vlm_raw_metrics.vision_encoder_durations.emplace_back(
+                MicroSeconds(enc->take_encoder_infer_duration().count()));
+        }
     }
 
     m_lm_extra_inputs["visual_pos_masks"] = create_visual_pos_masks(input_ids, image_pad_token_id, video_pad_token_id);

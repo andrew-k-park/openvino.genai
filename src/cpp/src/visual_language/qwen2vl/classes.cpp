@@ -747,7 +747,12 @@ void VisionEncoderQwen2VL::encode_with_imagepreprocess_cpp(const std::vector<ov:
     std::memcpy(flattened_patches.data(), transposed_patches.data(), transposed_patches.get_byte_size());
 
     encoder.set_tensor("hidden_states", flattened_patches);
-    encoder.infer();
+    {
+        auto _t0 = std::chrono::steady_clock::now();
+        encoder.infer();
+        m_encoder_infer_duration += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - _t0);
+    }
 
     const ov::Tensor& infer_output = encoder.get_output_tensor();
     // Just avoid to multiple copy.
@@ -855,7 +860,12 @@ void VisionEncoderQwen2VL::encode_with_imagepreprocess_ov(const std::vector<ov::
     encoder.set_tensor("reshape_shape4d", reshape_shape4d);
     encoder.set_tensor("reshape_shape2d", reshape_shape2d);
 
-    encoder.infer();
+    {
+        auto _t0 = std::chrono::steady_clock::now();
+        encoder.infer();
+        m_encoder_infer_duration += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - _t0);
+    }
 
     const ov::Tensor& infer_output = encoder.get_output_tensor();
 
