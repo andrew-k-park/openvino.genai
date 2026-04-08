@@ -54,6 +54,10 @@ public:
 protected:
     // Vision embeddings position model
     std::unique_ptr<CircularBufferQueue<ov::InferRequest>> m_ireq_queue_vision_embeddings_pos;
+
+    // Sub-model timing accumulators (set by run_video_image_embeddings_merger, read by get_inputs_embeds)
+    MicroSeconds m_last_pos_embed_duration{0};
+    MicroSeconds m_last_merger_duration{0};
     
     // Cached extra inputs for language model
     std::unordered_map<std::string, ov::Tensor> m_lm_extra_inputs{

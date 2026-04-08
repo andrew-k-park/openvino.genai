@@ -31,6 +31,15 @@ VLMPerfMetrics VLMPerfMetrics::operator+(const VLMPerfMetrics& right) const {
     result_prepare_embeddings_durations.insert(result_prepare_embeddings_durations.end(),
                                                 right_prepare_embeddings_durations.begin(),
                                                 right_prepare_embeddings_durations.end());
+
+    auto append = [](std::vector<MicroSeconds>& dst, const std::vector<MicroSeconds>& src) {
+        dst.insert(dst.end(), src.begin(), src.end());
+    };
+    append(result.vlm_raw_metrics.text_embed_durations, right.vlm_raw_metrics.text_embed_durations);
+    append(result.vlm_raw_metrics.pos_embed_durations, right.vlm_raw_metrics.pos_embed_durations);
+    append(result.vlm_raw_metrics.merger_durations, right.vlm_raw_metrics.merger_durations);
+    append(result.vlm_raw_metrics.vision_encoder_durations, right.vlm_raw_metrics.vision_encoder_durations);
+
     return result;
 }
 }

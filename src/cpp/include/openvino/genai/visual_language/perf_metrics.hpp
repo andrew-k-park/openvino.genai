@@ -12,6 +12,14 @@ namespace ov::genai {
 struct OPENVINO_GENAI_EXPORTS VLMRawPerfMetrics {
     /** @brief Duration of preparation of embeddings */
     std::vector<MicroSeconds> prepare_embeddings_durations;
+    /** @brief Duration of text embedding model inference within EmbedPrep */
+    std::vector<MicroSeconds> text_embed_durations;
+    /** @brief Duration of position embedding model inference within EmbedPrep */
+    std::vector<MicroSeconds> pos_embed_durations;
+    /** @brief Duration of vision embeddings merger model inference within EmbedPrep */
+    std::vector<MicroSeconds> merger_durations;
+    /** @brief Total duration of vision encoder (patch embedding) inference within EmbedPrep */
+    std::vector<MicroSeconds> vision_encoder_durations;
 };
 
 struct OPENVINO_GENAI_EXPORTS VLMPerfMetrics : public PerfMetrics {

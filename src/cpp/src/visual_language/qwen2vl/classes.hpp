@@ -4,6 +4,7 @@
 #pragma once
 
 #include <filesystem>
+#include <chrono>
 
 #include "visual_language/vlm_config.hpp"
 
@@ -21,6 +22,13 @@ public:
 
     EncodedImage encode(const ov::Tensor& image, const ov::AnyMap& config_map) override;
     EncodedVideo encode_frames(const std::vector<ov::Tensor>& frames, const ov::AnyMap& config_map) override;
+
+    /** @brief Returns accumulated vision encoder infer duration since last call and resets the counter. */
+    std::chrono::microseconds take_encoder_infer_duration() {
+        auto val = m_encoder_infer_duration;
+        m_encoder_infer_duration = std::chrono::microseconds{0};
+        return val;
+    }
 
 protected:
     /**
@@ -52,6 +60,9 @@ private:
         size_t frame_id = 0);
 
     bool use_ov_vision_preprocess = true; // default use ov vision preprocess, control by env VISION_PREPROCESS=CPP to use cpp vision preprocess
+
+    /** @brief Accumulated vision encoder infer time across all encode calls since last take_encoder_infer_duration(). */
+    std::chrono::microseconds m_encoder_infer_duration{0};
 };
 
 class InputsEmbedderQwen2VL : public InputsEmbedder::IInputsEmbedder {

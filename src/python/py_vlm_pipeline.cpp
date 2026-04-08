@@ -157,6 +157,18 @@ void init_vlm_pipeline(py::module_& m) {
         .def(py::init<>())
         .def_property_readonly("prepare_embeddings_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
             return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::prepare_embeddings_durations);
+        })
+        .def_property_readonly("text_embed_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::text_embed_durations);
+        })
+        .def_property_readonly("pos_embed_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::pos_embed_durations);
+        })
+        .def_property_readonly("merger_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::merger_durations);
+        })
+        .def_property_readonly("vision_encoder_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::vision_encoder_durations);
         });
 
     py::class_<ov::genai::VLMPerfMetrics, ov::genai::PerfMetrics>(m, "VLMPerfMetrics", perf_metrics_docstring)
