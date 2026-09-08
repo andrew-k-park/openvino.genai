@@ -407,6 +407,47 @@ TEST(TestBlockManager, PrefixCachingCompleteCheckpointReuseAllocatesOwnedWriteBl
     block_manager.free_sequence(second_seq_id);
 }
 
+TEST(TestBlockManager, PrefixCachingConcurrentProducersPreserveFirstCachedBlock) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(
+        /*num_blocks=*/8,
+        /*enable_prefix_caching=*/true,
+        block_size,
+        /*num_layers=*/1);
+
+    const std::vector<int64_t> tokens = {0, 1, 2, 3};
+    auto first_producer_group = create_sequence_group(tokens, 31);
+    auto second_producer_group = create_sequence_group(tokens, 32);
+    first_producer_group->schedule_tokens(tokens.size());
+    second_producer_group->schedule_tokens(tokens.size());
+    block_manager.append_slots(first_producer_group);
+    block_manager.append_slots(second_producer_group);
+
+    const auto first_producer_seq_id = first_producer_group->get_running_sequences().at(0)->get_id();
+    const auto second_producer_seq_id = second_producer_group->get_running_sequences().at(0)->get_id();
+    const auto first_cached_block_idx = block_manager.get_block_table(first_producer_seq_id, 0).at(0)->get_index();
+    const auto duplicate_block_idx = block_manager.get_block_table(second_producer_seq_id, 0).at(0)->get_index();
+    ASSERT_NE(first_cached_block_idx, duplicate_block_idx);
+
+    auto first_consumer_group = create_sequence_group(tokens, 33);
+    block_manager.restore_cached_blocks(first_consumer_group);
+    const auto first_consumer_seq_id = first_consumer_group->get_running_sequences().at(0)->get_id();
+    ASSERT_EQ(block_manager.get_block_table(first_consumer_seq_id, 0).size(), 1);
+    EXPECT_EQ(block_manager.get_block_table(first_consumer_seq_id, 0).at(0)->get_index(), first_cached_block_idx);
+
+    block_manager.free_sequence(second_producer_seq_id);
+
+    auto second_consumer_group = create_sequence_group(tokens, 34);
+    block_manager.restore_cached_blocks(second_consumer_group);
+    const auto second_consumer_seq_id = second_consumer_group->get_running_sequences().at(0)->get_id();
+    ASSERT_EQ(block_manager.get_block_table(second_consumer_seq_id, 0).size(), 1);
+    EXPECT_EQ(block_manager.get_block_table(second_consumer_seq_id, 0).at(0)->get_index(), first_cached_block_idx);
+
+    block_manager.free_sequence(first_producer_seq_id);
+    block_manager.free_sequence(first_consumer_seq_id);
+    block_manager.free_sequence(second_consumer_seq_id);
+}
+
 TEST(TestBlockManager, SequenceHashRejectsZeroContentLength) {
     auto sequence_group = create_sequence_group();
     auto sequence = sequence_group->get_running_sequences().at(0);

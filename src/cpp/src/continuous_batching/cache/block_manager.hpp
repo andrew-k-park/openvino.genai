@@ -77,6 +77,10 @@ public:
 
 using BlocksPerLayer = std::vector<CacheBlock::Ptr>;
 
+inline bool same_physical_blocks(const BlocksPerLayer& lhs, const BlocksPerLayer& rhs) {
+    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
+}
+
 /**
  * @brief Allows to store and retrieve KV-cache blocks based on their content- and position-based hash.
  * Blocks with the same prefix in the generated sequence will have the same hash. Blocks within this store
@@ -109,7 +113,7 @@ class OverwritableBlocksHashStore {
             }
         }
         OPENVINO_ASSERT(m_blocks.count(hash) == 0);
-        m_blocks[hash] = blocks_for_all_layers;
+        m_blocks.emplace(hash, blocks_for_all_layers);
     }
 
 
@@ -211,6 +215,7 @@ public:
     struct CacheBlockAllocationResult {
         BlocksPerLayer blocks;
         std::optional<uint64_t> erased_hash;
+        bool inserted_hash = false;
 
         operator BlocksPerLayer&() {
             return blocks;
@@ -426,6 +431,16 @@ public:
                 }
                 bool is_all_have_same_hash = (hashes_across_blocks.size() == 1);
                 if (is_all_have_same_hash) {
+                    const auto cached_it = cached_blocks.find(*hashes_across_blocks.begin());
+                    if (cached_it == cached_blocks.end() ||
+                        !same_physical_blocks(cached_it->second, blocks_for_all_layers)) {
+                        for (size_t layer_idx = 0; layer_idx < blocks_for_all_layers.size(); layer_idx++) {
+                            m_free_blocks[layer_idx].push_back(blocks_for_all_layers[layer_idx]);
+                            ++m_free_blocks_num[layer_idx];
+                        }
+                        return;
+                    }
+
                     // guard against hash collision
                     auto colliding_blocks = m_overwriteable_blocks.clean_store(hashes_across_blocks);
                     if (!colliding_blocks.empty()) {
@@ -536,14 +551,17 @@ public:
                 m_free_blocks[i].pop_front();
                 --m_free_blocks_num[i];
             }
-            cached_blocks[hash] = result.blocks;
+            result.inserted_hash = cached_blocks.emplace(hash, result.blocks).second;
             return result;
         }
         if (m_overwriteable_blocks.num_blocks() > 0) {
             // get least recently used block from store and reuse it
             result.blocks = m_overwriteable_blocks.get_lru_block_to_overwrite();
             const uint64_t previous_hash = result.blocks[0]->get_hash();
-            if (cached_blocks.erase(previous_hash) > 0) {
+            auto previous_it = cached_blocks.find(previous_hash);
+            if (previous_it != cached_blocks.end() &&
+                same_physical_blocks(previous_it->second, result.blocks)) {
+                cached_blocks.erase(previous_it);
                 result.erased_hash = previous_hash;
             }
 
@@ -551,7 +569,7 @@ public:
             for (auto& block : result.blocks) {
                 block->set_hash(hash);
             }
-            cached_blocks[hash] = result.blocks;
+            result.inserted_hash = cached_blocks.emplace(hash, result.blocks).second;
             return result;
         }
         // should not be reachable due to the can_allocate_blocks assert in the beginning
@@ -1577,10 +1595,7 @@ public:
                             auto& last_block = last_blocks[i];
                             last_block->set_hash(hash);
                         }
-                        m_prefix_hash_to_cached_blocks.erase(prev_hash);
-                        m_prefix_hash_to_cached_blocks[hash] = last_blocks;
-                        unregister_cached_hash(prev_hash);
-                        register_cached_content_length(hash, content_length);
+                        update_cached_block_mapping(prev_hash, hash, last_blocks, content_length);
                     }
                 }
             }
@@ -1881,8 +1896,28 @@ private:
         if (allocation_result.erased_hash.has_value()) {
             unregister_cached_hash(*allocation_result.erased_hash);
         }
-        register_cached_content_length(hash, content_length);
+        if (allocation_result.inserted_hash) {
+            register_cached_content_length(hash, content_length);
+        }
         return allocation_result.blocks;
+    }
+
+    void update_cached_block_mapping(uint64_t previous_hash,
+                                     uint64_t hash,
+                                     const BlocksPerLayer& blocks,
+                                     size_t content_length) {
+        if (previous_hash != hash) {
+            auto previous_it = m_prefix_hash_to_cached_blocks.find(previous_hash);
+            if (previous_it != m_prefix_hash_to_cached_blocks.end() &&
+                same_physical_blocks(previous_it->second, blocks)) {
+                m_prefix_hash_to_cached_blocks.erase(previous_it);
+                unregister_cached_hash(previous_hash);
+            }
+        }
+
+        if (m_prefix_hash_to_cached_blocks.emplace(hash, blocks).second) {
+            register_cached_content_length(hash, content_length);
+        }
     }
 
     void allocate(ov::genai::Sequence::Ptr sequence, size_t num_blocks, size_t prompt_size = 0) {
@@ -1920,12 +1955,9 @@ private:
                     for (size_t layer_idx = 0; layer_idx < m_num_layers; layer_idx++) {
                         auto& lst_blk = m_block_table[sequence_id][layer_idx].back();
                         lst_blk->set_hash(hash);
-                        m_prefix_hash_to_cached_blocks.erase(prev_hash);
                         last_blocks_vec.push_back(lst_blk);
                     }
-                    m_prefix_hash_to_cached_blocks[hash] = last_blocks_vec;
-                    unregister_cached_hash(prev_hash);
-                    register_cached_content_length(hash, content_length);
+                    update_cached_block_mapping(prev_hash, hash, last_blocks_vec, content_length);
                 }
             }
             for (size_t i = 0; i < num_blocks; ++i) {

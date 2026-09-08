@@ -201,7 +201,6 @@ TEST_F(PrefixCachingBlockAllocatorTest, ThrowsAtAllocationWhenFull) {
 }
 
 TEST_F(PrefixCachingBlockAllocatorTest, HandlesHashCollisionsAtFreeCorrectly) {
-    // TODO (vshampor): also handle collisions during allocations (multimap instead of map?)
     auto cached_blocks_map = std::map<uint64_t, ov::genai::BlocksPerLayer>{};
     auto first_hash_0_block = allocator.allocate_block(0, cached_blocks_map);
     allocator.free(first_hash_0_block, cached_blocks_map);
@@ -214,7 +213,7 @@ TEST_F(PrefixCachingBlockAllocatorTest, HandlesHashCollisionsAtFreeCorrectly) {
     auto second_hash_0_block = allocator.allocate_block(0, cached_blocks_map);
     EXPECT_EQ(allocator.num_overwriteable_blocks(), 1);
 
-    // this "free" should replace the old block with the same hash in the overwritable store
+    // The duplicate block returns to the free pool without replacing the first cached block.
     allocator.free(second_hash_0_block, cached_blocks_map);
     EXPECT_EQ(allocator.num_overwriteable_blocks(), 1);
 
@@ -222,7 +221,7 @@ TEST_F(PrefixCachingBlockAllocatorTest, HandlesHashCollisionsAtFreeCorrectly) {
         empty_map{};  // to force allocator to take the block from overwritable store
     auto internal_overwriteable_block = allocator.get_cached_block(0, empty_map);
     for (size_t layer_idx = 0; layer_idx < internal_overwriteable_block.size(); layer_idx++) {
-        EXPECT_EQ(internal_overwriteable_block[layer_idx], second_hash_0_block[layer_idx]);
+        EXPECT_EQ(internal_overwriteable_block[layer_idx], first_hash_0_block[layer_idx]);
     }
     allocator.free(internal_overwriteable_block, cached_blocks_map);
 
@@ -237,12 +236,12 @@ TEST_F(PrefixCachingBlockAllocatorTest, HandlesPrefixHashMapAtHashCollisionCorre
 
     // === Round 1: two sequences both allocate blocks with shared prefix hash H ===
     auto blkA = alloc.allocate_block(H, cached);  // blk0, cached[H]=blk0
-    auto blkB = alloc.allocate_block(H, cached);  // blk1, cached[H]=blk1 (overwrites blk0)
+    auto blkB = alloc.allocate_block(H, cached);  // blk1, cached[H] remains blk0
 
-    alloc.free(blkB, cached);  // blk1 → OW store, cached[H]=blk1
-    ASSERT_EQ(alloc.num_overwriteable_blocks(), 1);
+    alloc.free(blkB, cached);  // duplicate blk1 returns to the free pool
+    ASSERT_EQ(alloc.num_overwriteable_blocks(), 0);
 
-    alloc.free(blkA, cached);  // hash collision: blk1 evicted from OW to free list, cached[H] now points to blk0
+    alloc.free(blkA, cached);  // canonical blk0 enters the OW store
     ASSERT_EQ(alloc.num_overwriteable_blocks(), 1);
     ASSERT_EQ(cached.count(H), 1);
     ASSERT_EQ(cached.at(H).at(0), blkA.at(0));
