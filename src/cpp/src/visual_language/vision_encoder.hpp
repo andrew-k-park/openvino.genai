@@ -15,9 +15,10 @@
 
 namespace ov::genai {
 
-enum class VisionType {
+enum class ModalityType {
     IMAGE,
-    VIDEO
+    VIDEO,
+    AUDIO
 };
 
 /// @brief A pair describing image size.
@@ -65,6 +66,10 @@ struct EncodedImage {
     /// @brief Resampled image, used only by MiniCPM.
     ResampledImage resampled_image;
 
+    /// @brief Per-crop patch grids (order - thumbnail first, then detail slices by rows).
+    /// Used only by MiniCPM-V 4.7.
+    std::vector<ImageSize> crop_grids;
+
     /// @brief Number of image tokens required to append to a normalized prompt
     size_t num_image_tokens = 0;
 };
@@ -84,8 +89,26 @@ struct EncodedVideo {
     /// @brief A number of encoded frames.
     size_t frame_num = 0;
 
+    /// @brief Per-crop patch grids of a single frame (thumbnail first, then detail slices by rows).
+    /// Every frame of the video shares this layout. Used only by MiniCPM-V 4.7.
+    std::vector<ImageSize> crop_grids;
+
+    /// @brief Slice layout {rows, cols} of a single frame (empty when a frame is not sliced).
+    /// Used only by MiniCPM-V 4.7.
+    ov::Shape slices_shape;
+
     /// @brief Video metadata, used for video input processing and prompt normalization.
     VideoMetadata metadata;
+};
+
+/// @brief Encoder output for one audio. Empty inputs stay in the list as zero-token entries,
+/// otherwise every later `<ov_genai_audio_N>` index would shift.
+struct EncodedAudio {
+    /// @brief Audio encoder output. Shape [num_audio_tokens, hidden_size], element type f32.
+    ov::Tensor audio_features;
+
+    /// @brief Placeholder count this audio expands to. Equals audio_features.get_shape()[0].
+    size_t num_audio_tokens = 0;
 };
 
 /// @brief A class used to infer embeddings of an image using
