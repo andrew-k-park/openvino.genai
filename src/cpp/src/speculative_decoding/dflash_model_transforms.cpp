@@ -14,6 +14,7 @@
 
 #include "openvino/op/concat.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/parameter.hpp"
@@ -42,6 +43,10 @@ void add_dflash_hidden_state_result(std::shared_ptr<ov::Model>& model,
         output_to_operate = concat->output(0);
     } else {
         output_to_operate = hidden_state_outputs[0];
+    }
+    // f32 doubles the [seq_len, 1, layers * hidden] hand-off buffer; the draft converts it to f16 anyway.
+    if (output_to_operate.get_element_type() == ov::element::f32) {
+        output_to_operate = std::make_shared<ov::op::v0::Convert>(output_to_operate, ov::element::f16)->output(0);
     }
 
     auto result = std::make_shared<ov::op::v0::Result>(output_to_operate);
@@ -312,10 +317,18 @@ void reshape_draft_hidden_states_input_for_cb(std::shared_ptr<ov::Model>& model)
                     "DFlash draft hidden_states input has no live consumers.");
     hidden_states->set_partial_shape(ov::PartialShape({draft_shape[1], ov::Dimension(1), draft_shape[2]}));
 
+    // Must match the f16 hidden-state Result added on the target by add_dflash_hidden_state_result().
+    ov::Output<ov::Node> hidden_input = hidden_states->output(0);
+    const auto exported_type = hidden_states->get_element_type();
+    if (exported_type == ov::element::f32) {
+        hidden_states->set_element_type(ov::element::f16);
+        hidden_input = std::make_shared<ov::op::v0::Convert>(hidden_states, exported_type)->output(0);
+    }
+
     auto reshape_shape = ov::op::v0::Constant::create(ov::element::i64,
                                                      ov::Shape{3},
                                                      std::vector<int64_t>{1, -1, 0});
-    auto reshape = std::make_shared<ov::op::v1::Reshape>(hidden_states, reshape_shape, true);
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(hidden_input, reshape_shape, true);
     reshape->set_friendly_name("dflash_hidden_states_cb_to_draft_layout");
 
     for (auto consumer : original_consumers) {
